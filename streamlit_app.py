@@ -12,32 +12,46 @@ from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Nomad 추천 대시보드", layout="wide")
 
-# =========================================================
-# 경로 후보
-# =========================================================
+# -------------------------------------------------
+# 경로/폴더
+# -------------------------------------------------
+APP_DIR  = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(APP_DIR, "data")
+
+# CSV 기본 탐색 경로 (data → 루트 → /mnt/data)
 CANDIDATE_BASES = [
-    r"C:\Users\123cl\OneDrive\바탕 화면\test",  # Windows OneDrive
-    "/mnt/data",                                # 리눅스/노트북
-    ".",                                        # 현재 폴더
+    DATA_DIR,   # ./data
+    APP_DIR,    # .
+    "/mnt/data"
 ]
 
 def build_paths():
+    """필요한 CSV 3종을 후보 경로에서 탐색"""
     for base in CANDIDATE_BASES:
         fv = os.path.join(base, "20250809144224_광역별 방문자 수.csv")
         fc = os.path.join(base, "PLP_업종별_검색건수_통합.csv")
         ft = os.path.join(base, "PLP_유형별_검색건수_통합.csv")
         if all(os.path.exists(p) for p in [fv, fc, ft]):
             return fv, fc, ft
-    return fv, fc, ft
+    # 마지막 시도(루트 기준명 반환)
+    return (
+        os.path.join(CANDIDATE_BASES[0], "20250809144224_광역별 방문자 수.csv"),
+        os.path.join(CANDIDATE_BASES[0], "PLP_업종별_검색건수_통합.csv"),
+        os.path.join(CANDIDATE_BASES[0], "PLP_유형별_검색건수_통합.csv"),
+    )
 
 file_visitors, file_spend_cat, file_spend_type = build_paths()
 
 def resolve_geojson_path():
+    """GeoJSON을 data/ 와 루트에서 여러 후보명으로 탐색"""
+    env_path = os.environ.get("GEOJSON_PATH", "").strip()
+    if env_path and os.path.exists(env_path):
+        return env_path
     candidates = [
-        os.path.join(CANDIDATE_BASES[0], "korea_provinces.geojson"),
-        os.path.join(CANDIDATE_BASES[0], "KOREA_GEOJSON.geojson"),
-        "/mnt/data/korea_provinces.geojson",
-        "/mnt/data/KOREA_GEOJSON.geojson",
+        os.path.join(DATA_DIR, "korea_provinces.geojson"),
+        os.path.join(DATA_DIR, "KOREA_GEOJSON.geojson"),
+        os.path.join(APP_DIR,  "korea_provinces.geojson"),
+        os.path.join(APP_DIR,  "KOREA_GEOJSON.geojson"),
     ]
     for p in candidates:
         if os.path.exists(p):
@@ -46,12 +60,12 @@ def resolve_geojson_path():
 
 KOREA_GEOJSON = resolve_geojson_path()
 
-# 국내 GeoJSON의 지역명 키 후보 (KOSTAT 2018 호환: name 우선)
+# 국내 GeoJSON의 지역명 키 후보
 GEO_PROP_KEYS = ["name", "CTPRVN_NM", "ADM1_KOR_NM", "sido_nm", "SIG_KOR_NM", "NAME_1"]
 
-# =========================================================
-# 안전 GeoJSON 로더 + 캐시
-# =========================================================
+# -------------------------------------------------
+# 안전 GeoJSON 로더 (캐시)
+# -------------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_geojson_safe(path: str):
     import re
@@ -236,9 +250,7 @@ metrics_map = metrics.merge(coords_df, on="지역_norm", how="left")
 # UI (좌: 지도 / 우: 커뮤니티 패널)
 # =====================================================
 st.title("디지털 노마드 지역 추천 대시보드")
-
 left, right = st.columns([2, 1])
-
 with left:
     st.subheader("지도에서 지역을 선택하세요")
 
@@ -388,10 +400,10 @@ with left:
         gj, gj_err = load_geojson_safe(KOREA_GEOJSON)
 
     if gj is None:
-        st.warning(f"GeoJSON 로드 실패 → 마커 모드, 원인: {gj_err}")
         # 폴리곤 실패 시 마커 모드
         for _, r in ranked.iterrows():
-            if pd.isna(r.get("lat")) or pd.isna(r.get("lon")): continue
+            if pd.isna(r.get("lat")) or pd.isna(r.get("lon")): 
+                continue
             color = pick_color(r["지역_norm"], selected_norm)
             nsi = float(r.get("NSI", r.get("NSI_base", 0.0)))
             size = 6 + 14 * nsi
@@ -480,7 +492,6 @@ with left:
 # =================== 커뮤니티 패널(오른쪽) ===================
 with right:
     st.subheader("커뮤니티")
-    # 카드 스타일 컨테이너
     st.markdown(
         """
         <div style="
@@ -494,21 +505,19 @@ with right:
         </div>
         """, unsafe_allow_html=True
     )
-    # 실제 인터랙션 위젯
     role_col1, role_col2 = st.columns(2)
     with role_col1:
         buddy_on = st.toggle("🧑‍🤝‍🧑 버디 선택", value=False, help="지역 청년/학생 버디로 참여")
     with role_col2:
         tourist_on = st.toggle("🧳 관광객 선택", value=False, help="체류/여행자로 참여")
 
-    # 상태 표시
     st.caption("선택 상태")
     st.write(
         f"- 버디: **{'참여' if buddy_on else '미참여'}**  |  "
         f"관광객: **{'참여' if tourist_on else '미참여'}**"
     )
 
-# =================== 이하: 랭킹/키워드 섹션 ===================
+# =================== 랭킹/키워드 섹션 ===================
 st.subheader("추천 랭킹")
 rec = ranked.sort_values("NSI", ascending=False)[
     ["광역지자체명","NSI","NSI_base","방문자수_합계","방문자_점유율",
@@ -527,7 +536,11 @@ col1, col2, col3 = st.columns(3)
 with col1:
     st.text_input("지역", st.session_state.selected_region or "", disabled=True)
 with col2:
-    sel_big = st.selectbox("대분류 선택(업종)", ["--전체--"] + sorted(cat["대분류"].cat.categories.tolist()))
+    sel_big = st.selectbox(
+        "대분류 선택(업종)",
+        ["--전체--"] + sorted(cat["대분류"].cat.categories.tolist())
+        if hasattr(cat["대분류"], "cat") else ["--전체--"] + sorted(cat["대분류"].dropna().unique().tolist())
+    )
 with col3:
     kw = st.text_input("키워드(중분류명 부분 일치)", "")
 
@@ -553,13 +566,25 @@ if st.session_state.selected_region:
         st.dataframe(top_cat, use_container_width=True)
         st.bar_chart(top_cat.set_index("중분류")["중분류_전체비중"])
     with tabs[1]:
-        sel_big2 = st.selectbox("대분류 선택(유형)", ["--전체--"] + sorted(typ["대분류"].cat.categories.tolist()), key="type_big")
+        sel_big2 = st.selectbox(
+            "대분류 선택(유형)",
+            ["--전체--"] + sorted(typ["대분류"].cat.categories.tolist())
+            if hasattr(typ["대분류"], "cat") else ["--전체--"] + sorted(typ["대분류"].dropna().unique().tolist()),
+            key="type_big"
+        )
         kw2 = st.text_input("키워드(중분류명 부분 일치)", "", key="type_kw")
         top_typ = top_keywords(typ, st.session_state.selected_region, sel_big2, kw2, topn=12)
         st.dataframe(top_typ, use_container_width=True)
         st.bar_chart(top_typ.set_index("중분류")["중분류_전체비중"])
 else:
     st.info("지도에서 영역을 클릭하거나, 우측 패널·드롭다운을 이용해 지역을 선택하세요.")
+
+# ----------- 상태/경로 디버그(필요시 주석 해제) -----------
+st.caption("📁 데이터/지도 경로 상태")
+st.write(f"- 방문자 수: {file_visitors}  (exists={os.path.exists(file_visitors)})")
+st.write(f"- 업종별: {file_spend_cat}  (exists={os.path.exists(file_spend_cat)})")
+st.write(f"- 유형별: {file_spend_type}  (exists={os.path.exists(file_spend_type)})")
+st.write(f"- GeoJSON: {KOREA_GEOJSON}  (exists={bool(KOREA_GEOJSON and os.path.exists(KOREA_GEOJSON))})")
 
 st.markdown("""
 ---

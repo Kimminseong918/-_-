@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 import os
 import json
+import re
+import time
+import uuid
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,30 +13,22 @@ import folium
 from folium.features import GeoJson, GeoJsonTooltip, GeoJsonPopup
 from streamlit_folium import st_folium
 
-st.set_page_config(page_title="Nomad 추천 대시보드", layout="wide")
+st.set_page_config(page_title="디지털 노마드 지역 추천 대시보드", layout="wide")
 
-# -------------------------------------------------
-# 경로/폴더
-# -------------------------------------------------
+# ------------------------------- 경로/폴더 -------------------------------
 APP_DIR  = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# CSV 기본 탐색 경로 (data → 루트 → /mnt/data)
-CANDIDATE_BASES = [
-    DATA_DIR,   # ./data
-    APP_DIR,    # .
-    "/mnt/data"
-]
+CANDIDATE_BASES = [DATA_DIR, APP_DIR, "/mnt/data"]
 
 def build_paths():
-    """필요한 CSV 3종을 후보 경로에서 탐색"""
     for base in CANDIDATE_BASES:
         fv = os.path.join(base, "20250809144224_광역별 방문자 수.csv")
         fc = os.path.join(base, "PLP_업종별_검색건수_통합.csv")
         ft = os.path.join(base, "PLP_유형별_검색건수_통합.csv")
         if all(os.path.exists(p) for p in [fv, fc, ft]):
             return fv, fc, ft
-    # 마지막 시도(루트 기준명 반환)
     return (
         os.path.join(CANDIDATE_BASES[0], "20250809144224_광역별 방문자 수.csv"),
         os.path.join(CANDIDATE_BASES[0], "PLP_업종별_검색건수_통합.csv"),
@@ -43,7 +38,6 @@ def build_paths():
 file_visitors, file_spend_cat, file_spend_type = build_paths()
 
 def resolve_geojson_path():
-    """GeoJSON을 data/ 와 루트에서 여러 후보명으로 탐색"""
     env_path = os.environ.get("GEOJSON_PATH", "").strip()
     if env_path and os.path.exists(env_path):
         return env_path
@@ -59,16 +53,11 @@ def resolve_geojson_path():
     return ""
 
 KOREA_GEOJSON = resolve_geojson_path()
-
-# 국내 GeoJSON의 지역명 키 후보
 GEO_PROP_KEYS = ["name", "CTPRVN_NM", "ADM1_KOR_NM", "sido_nm", "SIG_KOR_NM", "NAME_1"]
 
-# -------------------------------------------------
-# 안전 GeoJSON 로더 (캐시)
-# -------------------------------------------------
+# --------------------------- 안전 GeoJSON 로더 ---------------------------
 @st.cache_data(show_spinner=False)
 def load_geojson_safe(path: str):
-    import re
     if not path or not os.path.exists(path):
         return None, "missing_path"
     try:
@@ -76,11 +65,7 @@ def load_geojson_safe(path: str):
             return None, "empty_file"
     except Exception:
         pass
-
-    encodings = (
-        "utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be",
-        "cp949", "euc-kr", "latin-1"
-    )
+    encodings = ("utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "cp949", "euc-kr", "latin-1")
     last_err = None
     for enc in encodings:
         try:
@@ -88,7 +73,7 @@ def load_geojson_safe(path: str):
                 txt = f.read().strip()
             if not txt:
                 return None, f"empty_text({enc})"
-            if txt.lstrip().startswith(("var ", "const ", "let ")):  # JS 변수 래핑
+            if txt.lstrip().startswith(("var ", "const ", "let ")):
                 m = re.search(r"\{.*\}\s*;?\s*$", txt, flags=re.S)
                 if m:
                     txt = m.group(0)
@@ -105,7 +90,7 @@ def load_geojson_safe(path: str):
             continue
     return None, last_err or "unknown_error"
 
-# === 지역(광역) 중심점 좌표 (대략값) ===
+# ---------------------------- 좌표 테이블 ----------------------------
 REGION_COORDS = {
     "서울": (37.5665, 126.9780), "부산": (35.1796, 129.0756), "대구": (35.8714, 128.6014),
     "인천": (37.4563, 126.7052), "광주": (35.1595, 126.8526), "대전": (36.3504, 127.3845),
@@ -115,7 +100,7 @@ REGION_COORDS = {
     "경남": (35.4606, 128.2132), "제주": (33.4996, 126.5312),
 }
 
-# ---------- CSV 로더(최적화: 필요한 컬럼만, 캐시) ----------
+# ----------------------------- CSV 로더 -----------------------------
 NEEDED_VIS_COLS = ["광역지자체명", "기초지자체 방문자 수"]
 NEEDED_PLP_COLS = ["지역", "대분류", "중분류", "대분류 지출액 비율", "중분류 지출액 비율"]
 
@@ -135,28 +120,25 @@ def read_data():
                              dtype={"지역": "string", "대분류": "string", "중분류": "string"})
     typ = read_csv_forgiving(file_spend_type, usecols=NEEDED_PLP_COLS,
                              dtype={"지역": "string", "대분류": "string", "중분류": "string"})
-    # 문자열 압축
     for df in (cat, typ):
         for c in ["지역", "대분류", "중분류"]:
             if c in df.columns:
                 df[c] = df[c].astype("category")
     return vis, cat, typ
 
-# =============== 데이터 로드 ===============
+# ----------------------- 데이터 로드 & 전처리 -----------------------
 try:
     vis, cat, typ = read_data()
 except Exception as e:
-    st.error(
-        f"데이터 파일을 찾거나 열 수 없습니다.\n\n"
-        f"- 방문자 수: {file_visitors}\n- 업종별: {file_spend_cat}\n- 유형별: {file_spend_type}\n\n{e}"
-    )
+    st.error("데이터 파일을 찾거나 열 수 없습니다.\n\n" + str(e))
     st.stop()
 
-# =============== 전처리/지표 계산 ===============
 def normalize_region_name(s: str) -> str:
     if s is None:
         return ""
-    s = str(s).strip()
+    s = str(s)
+    s = re.sub(r"\(.*?\)", "", s)
+    s = s.strip()
     for a in ["특별자치도","특별자치시","특별시","광역시","자치도","자치시","도","시"]:
         s = s.replace(a, "")
     return " ".join(s.split())
@@ -164,9 +146,9 @@ def normalize_region_name(s: str) -> str:
 def compute_overall_share(df):
     df = df.copy()
     for c in ["대분류 지출액 비율", "중분류 지출액 비율"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["대분류_f"] = df["대분류 지출액 비율"] / 100.0
-    df["중분류_f"] = df["중분류 지출액 비율"] / 100.0
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
+    df["대분류_f"] = df["대분류 지출액 비율"].fillna(0)/100.0
+    df["중분류_f"] = df["중분류 지출액 비율"].fillna(0)/100.0
     df["중분류_전체비중"] = df["대분류_f"] * df["중분류_f"]
     return df
 
@@ -180,11 +162,10 @@ total_visitors = max(vis_region["방문자수_합계"].sum(), 1)
 vis_region["방문자_점유율"] = vis_region["방문자수_합계"] / total_visitors
 vis_region["지역_norm"] = vis_region["광역지자체명"].map(normalize_region_name)
 
-# 소비/유형 다양성 & 숙박 비중
+# 다양성/숙박
 cat2 = compute_overall_share(cat)
 typ2 = compute_overall_share(typ)
 
-# region-level metrics (cat2)
 region_cat = []
 for region, g in cat2.groupby("지역"):
     s = g["중분류_전체비중"].dropna().values
@@ -201,7 +182,6 @@ for region, g in cat2.groupby("지역"):
 region_cat = pd.DataFrame(region_cat)
 region_cat["지역_norm"] = region_cat["지역"].map(normalize_region_name)
 
-# region-level metrics (typ2)
 region_typ = []
 for region, g in typ2.groupby("지역"):
     s = g["중분류_전체비중"].dropna().values
@@ -216,73 +196,75 @@ for region, g in typ2.groupby("지역"):
 region_typ = pd.DataFrame(region_typ)
 region_typ["지역_norm"] = region_typ["지역"].map(normalize_region_name)
 
-# 통합 메트릭
 metrics = (
     vis_region.merge(region_cat.drop(columns=["지역"]), on="지역_norm", how="left")
               .merge(region_typ.drop(columns=["지역"]), on="지역_norm", how="left")
 )
 
 def minmax(s):
-    s = s.astype(float)
-    return (s - s.min()) / (s.max() - s.min()) if s.max() > s.min() else s * 0
+    s = pd.to_numeric(s, errors="coerce")
+    if s.notna().sum() == 0:
+        return s.fillna(0.0)
+    s = s.fillna(s.min())
+    d = (s.max() - s.min())
+    return (s - s.min()) / d if d > 0 else s*0
 
-metrics["방문자_점유율_norm"] = minmax(metrics["방문자_점유율"].fillna(0))
-metrics["소비_다양성_norm"]   = minmax(metrics["소비_다양성지수"].fillna(0))
-metrics["숙박_비중_norm"]     = minmax(metrics["숙박_지출비중(%)"].fillna(0))
-metrics["활동_다양성_norm"]   = minmax(metrics["활동_다양성지수"].fillna(0))
-
-# 기본 NSI(체크박스 적용 전 기본 가중치)
 BASE_WEIGHTS = dict(vis=0.30, div=0.30, lodg=0.20, act=0.20)
-def base_nsi(df):
-    return (
-        BASE_WEIGHTS["vis"]  * df["방문자_점유율_norm"] +
-        BASE_WEIGHTS["div"]  * df["소비_다양성_norm"] +
-        BASE_WEIGHTS["lodg"] * df["숙박_비중_norm"] +
-        BASE_WEIGHTS["act"]  * df["활동_다양성_norm"]
-    )
-metrics["NSI_base"] = base_nsi(metrics)
 
-# 좌표 DF
+def nsi_with(df):
+    return (BASE_WEIGHTS["vis"]  * df["방문자_점유율_norm"] +
+            BASE_WEIGHTS["div"]  * df["소비_다양성_norm"] +
+            BASE_WEIGHTS["lodg"] * df["숙박_비중_norm"] +
+            BASE_WEIGHTS["act"]  * df["활동_다양성_norm"])
+
 coords_df = pd.DataFrame([{"지역_norm": k, "lat": v[0], "lon": v[1]} for k, v in REGION_COORDS.items()])
-metrics_map = metrics.merge(coords_df, on="지역_norm", how="left")
 
-# =====================================================
-# UI (좌: 지도 / 우: 커뮤니티 패널)
-# =====================================================
+metrics_map = metrics.copy()
+metrics_map["방문자_점유율_norm"] = minmax(metrics_map["방문자_점유율"].fillna(0))
+metrics_map["소비_다양성_norm"]   = minmax(metrics_map["소비_다양성지수"].fillna(0))
+metrics_map["숙박_비중_norm"]     = minmax(metrics_map["숙박_지출비중(%)"].fillna(0))
+metrics_map["활동_다양성_norm"]   = minmax(metrics_map["활동_다양성지수"].fillna(0))
+metrics_map = metrics_map.merge(coords_df, on="지역_norm", how="left")
+metrics_map["NSI_base"] = nsi_with(metrics_map)
+
+# ============================ UI 레이아웃 ============================
 st.title("디지털 노마드 지역 추천 대시보드")
 left, right = st.columns([2, 1])
 with left:
     st.subheader("지도에서 지역을 선택하세요")
 
-# 사이드바 필터들 ------------------------------------------------
+# -------- 사이드바: 한국어 라벨 + 한 줄 고정(줄바꿈 방지) --------
+st.sidebar.markdown(
+    """
+    <style>
+    section[data-testid="stSidebar"] label { white-space: nowrap; } /* 줄바꿈 방지 */
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
 st.sidebar.header("추천 카테고리 선택")
-st.sidebar.caption("여러 조건을 선택하세요. (필터 + 보너스 가중)")
-colA1, colA2 = st.sidebar.columns(2)
-with colA1:
-    cb_popular = st.checkbox("🔥 Popular now", value=False)
-    cb_toprank = st.checkbox("🏅 Top ranked", value=True)
-    cb_hidden  = st.checkbox("💎 Hidden gem", value=False)
-with colA2:
-    cb_act_rich = st.checkbox("🎯 Activity-rich", value=False)
-    cb_lodging  = st.checkbox("🛏️ Lodging-ready", value=False)
-    cb_diverse  = st.checkbox("🛍️ Diverse consumption", value=False)
+
+# 단일 열(세로)로 배치
+cb_popular  = st.sidebar.checkbox("🔥 현재 인기 지역", value=False)
+cb_toprank  = st.sidebar.checkbox("🏅 상위 랭킹 지역", value=True)
+cb_hidden   = st.sidebar.checkbox("💎 숨은 보석 지역", value=False)
+cb_act_rich = st.sidebar.checkbox("🎯 활동이 다양한 지역", value=False)
+cb_lodging  = st.sidebar.checkbox("🛏️ 숙박이 좋은 지역", value=False)
+cb_diverse  = st.sidebar.checkbox("🛍️ 소비가 다양한 지역", value=False)
 
 st.sidebar.markdown("---")
-st.sidebar.caption("추가 지표(해당 컬럼이 있을 때 자동 반영)")
-colB1, colB2 = st.sidebar.columns(2)
-with colB1:
-    cb_budget  = st.checkbox("💰 Budget-friendly", value=False)
-    cb_fastnet = st.checkbox("🚀 Fast internet", value=False)
-with colB2:
-    cb_cleanair = st.checkbox("💨 Clean air now", value=False)
-    cb_safe     = st.checkbox("🛡️ Safe", value=False)
+cb_budget   = st.sidebar.checkbox("💰 저렴한 비용", value=False)     # 요청에 따라 용어 변경
+cb_fastnet  = st.sidebar.checkbox("🚀 빠른 인터넷", value=False)
+cb_cleanair = st.sidebar.checkbox("💨 깨끗한 공기", value=False)
+cb_safe     = st.sidebar.checkbox("🛡️ 안전한 지역", value=False)
 
 st.sidebar.markdown("---")
-match_mode = st.sidebar.radio("필터 결합 방식", ["ANY(하나 이상 충족)", "ALL(모두 충족)"], index=0)
+match_mode      = st.sidebar.radio("필터 결합 방식", ["ANY(하나 이상 충족)", "ALL(모두 충족)"], index=0)
 filter_strength = st.sidebar.slider("필터 강도", 0.0, 1.0, 0.5, 0.05)
 bonus_strength  = st.sidebar.slider("보너스 가중", 0.0, 0.5, 0.20, 0.01)
 
-# --------------------------------------------------------------
+# ----------------------------- 룰 적용 -----------------------------
 def apply_category_rules(df):
     g0 = df.copy()
     notes = []
@@ -297,22 +279,22 @@ def apply_category_rules(df):
     conds = []
     if cb_popular:
         conds.append(g0["방문자_점유율_norm"] >= (q_vis_hi * (1 - 0.3 * filter_strength)))
-        notes.append("Popular now: 방문자 상위")
+        notes.append("현재 인기: 방문자 상위")
     if cb_toprank:
         conds.append(g0["NSI_base"] >= (q_nsi_hi * (1 - 0.3 * filter_strength)))
-        notes.append("Top ranked: NSI 상위")
+        notes.append("상위 랭킹: NSI 상위")
     if cb_hidden:
         conds.append((g0["방문자_점유율_norm"] <= (q_vis_lo * (1 + 0.3 * filter_strength))) & (g0["NSI_base"] >= q_nsi_hi))
-        notes.append("Hidden gem: 방문자 하위 & NSI 상위")
+        notes.append("숨은 보석: 방문자 하위 & NSI 상위")
     if cb_act_rich:
         conds.append(g0["활동_다양성_norm"] >= (q_act_hi * (1 - 0.3 * filter_strength)))
-        notes.append("Activity-rich: 활동 다양성 상위")
+        notes.append("활동 다양: 활동 다양성 상위")
     if cb_lodging:
         conds.append(g0["숙박_비중_norm"] >= (q_lod_hi * (1 - 0.3 * filter_strength)))
-        notes.append("Lodging-ready: 숙박 비중 상위")
+        notes.append("숙박 인프라: 숙박 비중 상위")
     if cb_diverse:
         conds.append(g0["소비_다양성_norm"] >= (q_div_hi * (1 - 0.3 * filter_strength)))
-        notes.append("Diverse consumption: 소비 다양성 상위")
+        notes.append("소비 다양: 소비 다양성 상위")
 
     if len(conds) == 0:
         g = g0.copy()
@@ -334,8 +316,8 @@ def apply_category_rules(df):
     bonus = np.zeros(len(g))
     def add_bonus(series, strong_q): return bonus_strength * (series - strong_q).clip(lower=0)
 
-    if cb_popular: bonus += add_bonus(g["방문자_점유율_norm"], q_vis_hi)
-    if cb_toprank: bonus += add_bonus(g["NSI_base"], q_nsi_hi)
+    if cb_popular:  bonus += add_bonus(g["방문자_점유율_norm"], q_vis_hi)
+    if cb_toprank:  bonus += add_bonus(g["NSI_base"], q_nsi_hi)
     if cb_act_rich: bonus += add_bonus(g["활동_다양성_norm"], q_act_hi)
     if cb_lodging:  bonus += add_bonus(g["숙박_비중_norm"], q_lod_hi)
     if cb_diverse:  bonus += add_bonus(g["소비_다양성_norm"], q_div_hi)
@@ -345,38 +327,38 @@ def apply_category_rules(df):
         rng = (g["cost_index"].max() - g["cost_index"].min()) + 1e-9
         tmp = 1 - ((g["cost_index"] - g["cost_index"].min()) / rng)
         bonus += bonus_strength * tmp
-        notes.append("Budget: cost_index 적용")
+        notes.append("비용 저렴함: cost_index 적용")
     if cb_fastnet and has_col("internet_mbps"):
         rng = (g["internet_mbps"].max() - g["internet_mbps"].min()) + 1e-9
         tmp = (g["internet_mbps"] - g["internet_mbps"].min()) / rng
         bonus += bonus_strength * tmp
-        notes.append("Fast net: internet_mbps 적용")
+        notes.append("빠른 인터넷: internet_mbps 적용")
     if cb_cleanair and has_col("air_quality_pm25"):
         rng = (g["air_quality_pm25"].max() - g["air_quality_pm25"].min()) + 1e-9
         tmp = 1 - ((g["air_quality_pm25"] - g["air_quality_pm25"].min()) / rng)
         bonus += bonus_strength * tmp
-        notes.append("Clean air: pm2.5 적용")
+        notes.append("깨끗한 공기: pm2.5 적용")
     if cb_safe and has_col("safety_index"):
         rng = (g["safety_index"].max() - g["safety_index"].min()) + 1e-9
         tmp = (g["safety_index"] - g["safety_index"].min()) / rng
         bonus += bonus_strength * tmp
-        notes.append("Safe: safety_index 적용")
+        notes.append("안전한 지역: safety_index 적용")
 
     g["NSI"] = g["NSI_base"] + bonus
     return g, notes
 
-# ======== 메트릭/랭킹 생성 ========
+# ----------------------------- 랭킹 계산 -----------------------------
 metrics_after_rules, applied_notes = apply_category_rules(metrics_map)
+
 if "selected_region" not in st.session_state:
     st.session_state.selected_region = None
-
-sel_region = st.session_state.selected_region
+sel_region   = st.session_state.selected_region
 selected_norm = normalize_region_name(sel_region) if sel_region else None
 
 ranked = metrics_after_rules.copy()
+ranked["NSI"]  = ranked["NSI"].fillna(ranked["NSI_base"]).fillna(0.0)
 ranked["rank"] = ranked["NSI"].rank(ascending=False, method="min").astype(int)
 
-# 색상
 COLOR_TOP1, COLOR_TOP2, COLOR_TOP3 = "#ff6b6b", "#ffd43b", "#4dabf7"
 COLOR_SEL, COLOR_BASE = "#94d82d", "#b8c0cc"
 
@@ -386,35 +368,36 @@ def pick_color(region_norm, selected_region_norm=None):
     r = int(ranked.loc[ranked["지역_norm"] == region_norm, "rank"].min()) if region_norm in ranked["지역_norm"].values else 999
     return {1: COLOR_TOP1, 2: COLOR_TOP2, 3: COLOR_TOP3}.get(r, COLOR_BASE)
 
-# =================== 지도(왼쪽) ===================
+# =============================== 지도 ===============================
+MAP_HEIGHT = 680  # ⬅️ QnA 패널 높이에 맞춰 확대
 with left:
-    m = folium.Map(
-        location=[36.5, 127.8],
-        zoom_start=7,
-        tiles="cartodbpositron",
-        prefer_canvas=True   # 렌더 최적화
-    )
+    m = folium.Map(location=[36.5, 127.8], zoom_start=7, tiles="cartodbpositron", prefer_canvas=True)
 
     gj, gj_err = (None, "no_path")
     if KOREA_GEOJSON and os.path.exists(KOREA_GEOJSON):
         gj, gj_err = load_geojson_safe(KOREA_GEOJSON)
 
+    rank_lookup = ranked.set_index("지역_norm")[["rank","NSI"]].to_dict("index")
+
     if gj is None:
-        # 폴리곤 실패 시 마커 모드
         for _, r in ranked.iterrows():
             if pd.isna(r.get("lat")) or pd.isna(r.get("lon")): 
                 continue
             color = pick_color(r["지역_norm"], selected_norm)
-            nsi = float(r.get("NSI", r.get("NSI_base", 0.0)))
+            nsi = float(r.get("NSI", r.get("NSI_base", 0.0))) if pd.notna(r.get("NSI", np.nan)) else 0.0
+            nsi = max(min(nsi, 1.0), 0.0)
             size = 6 + 14 * nsi
+            tooltip_txt = f"{r['지역_norm']} · {int(r['rank'])}위 · NSI {nsi:.3f}"
             folium.CircleMarker(
                 location=[r["lat"], r["lon"]],
                 radius=size, color=color, fill=True, fill_color=color,
                 fill_opacity=0.75, opacity=0.9 if color != COLOR_BASE else 0.6,
-                weight=2 if color != COLOR_BASE else 1
+                weight=2 if color != COLOR_BASE else 1,
+                popup=r["지역_norm"],
+                tooltip=tooltip_txt,
             ).add_to(m)
     else:
-        # REGION_NAME 주입
+        # REGION_NAME & 랭킹 주입
         for ft in gj.get("features", []):
             props = ft.get("properties", {})
             region_raw = None
@@ -424,17 +407,24 @@ with left:
             if region_raw is None:
                 textish = [str(v) for v in props.values() if isinstance(v, str)]
                 region_raw = max(textish, key=len) if textish else ""
-            props["REGION_NAME"] = normalize_region_name(region_raw)
+            rname = normalize_region_name(region_raw)
+            props["REGION_NAME"] = rname
+            stats = rank_lookup.get(rname)
+            if stats:
+                props["RANK_TXT"] = f"{int(stats['rank'])}위"
+                props["NSI_TXT"]  = f"{float(stats['NSI']):.3f}"
+            else:
+                props["RANK_TXT"] = "-"
+                props["NSI_TXT"]  = "-"
+            ft["properties"] = props
 
         def style_function(feature):
             rname = feature["properties"].get("REGION_NAME", "")
             color = pick_color(rname, selected_norm)
-            return {
-                "fillColor": color, "color": color,
-                "weight": 2 if color != COLOR_BASE else 1,
-                "fillOpacity": 0.45 if color != COLOR_BASE else 0.25,
-                "opacity": 0.9 if color != COLOR_BASE else 0.6,
-            }
+            return {"fillColor": color, "color": color,
+                    "weight": 2 if color != COLOR_BASE else 1,
+                    "fillOpacity": 0.45 if color != COLOR_BASE else 0.25,
+                    "opacity": 0.9 if color != COLOR_BASE else 0.6}
 
         def highlight_function(feature):
             return {"fillOpacity": 0.75, "weight": 3}
@@ -444,16 +434,17 @@ with left:
             name="regions",
             style_function=style_function,
             highlight_function=highlight_function,
-            smooth_factor=1.0,   # 경계 간소화(렌더 가벼움)
+            smooth_factor=1.0,
             tooltip=GeoJsonTooltip(
-                fields=["REGION_NAME"], labels=False, sticky=True,
+                fields=["REGION_NAME", "RANK_TXT", "NSI_TXT"],
+                aliases=["지역", "랭킹", "NSI"],
+                labels=True, sticky=True,
                 style=("background-color: rgba(32,32,32,0.85); color: white; "
                        "font-size: 12px; padding: 6px 8px; border-radius: 6px;"),
             ),
             popup=GeoJsonPopup(fields=["REGION_NAME"], labels=False),
         ).add_to(m)
 
-        # 범례(1~3위)
         legend_html = f"""
         <div style="
           position: fixed; bottom: 20px; left: 20px; z-index: 9999;
@@ -478,69 +469,168 @@ with left:
         </div>"""
         m.get_root().html.add_child(folium.Element(legend_html))
 
-    # 지도를 조금 더 작게(높이 420)
     MAP_KEY = "main_map"
-    map_state = st_folium(m, width=None, height=420, key=MAP_KEY)
+    map_state = st_folium(m, width=None, height=MAP_HEIGHT, key=MAP_KEY)
 
-    # 클릭 디바운스
-    clicked = map_state.get("last_object_clicked_popup")
+    clicked = None
+    if map_state:
+        clicked = map_state.get("last_object_clicked_popup") \
+               or (map_state.get("last_active_drawing") or {}).get("properties", {}).get("REGION_NAME") \
+               or (map_state.get("last_object_clicked") or {}).get("popup")
     prev_clicked = st.session_state.get("_last_clicked")
     if clicked and clicked != prev_clicked:
         st.session_state.selected_region = normalize_region_name(str(clicked))
         st.session_state._last_clicked = clicked
 
-# =================== 커뮤니티 패널(오른쪽) ===================
+# ============================ 우측 패널 ============================
 with right:
     st.subheader("커뮤니티")
-    st.markdown(
-        """
-        <div style="
-            background: rgba(255,255,255,0.95);
-            border: 1px solid rgba(0,0,0,0.06);
-            border-radius: 12px;
-            padding: 16px 16px 6px 16px;">
-            <div style="font-weight:700; font-size:16px; margin-bottom:10px;">
-                역할 선택
-            </div>
-        </div>
-        """, unsafe_allow_html=True
-    )
     role_col1, role_col2 = st.columns(2)
     with role_col1:
-        buddy_on = st.toggle("🧑‍🤝‍🧑 버디 선택", value=False, help="지역 청년/학생 버디로 참여")
+        buddy_on = st.toggle("🧑‍🤝‍🧑 버디 선택", value=False)
     with role_col2:
-        tourist_on = st.toggle("🧳 관광객 선택", value=False, help="체류/여행자로 참여")
+        tourist_on = st.toggle("🧳 관광객 선택", value=False)
+    st.caption(f"- 버디: **{'참여' if buddy_on else '미참여'}**  |  관광객: **{'참여' if tourist_on else '미참여'}**")
 
-    st.caption("선택 상태")
-    st.write(
-        f"- 버디: **{'참여' if buddy_on else '미참여'}**  |  "
-        f"관광객: **{'참여' if tourist_on else '미참여'}**"
-    )
+    st.markdown("### 지역 하이라이트")
+    def region_reasons(row, q):
+        msgs = []
+        if row["방문자_점유율_norm"] >= q["vis_hi"]: msgs.append("방문 수요가 높아요")
+        if row["소비_다양성_norm"]   >= q["div_hi"]: msgs.append("소비 카테고리가 다양해요")
+        if row["숙박_비중_norm"]     >= q["lod_hi"]: msgs.append("숙박 인프라가 잘 갖춰져요")
+        if row["활동_다양성_norm"]   >= q["act_hi"]: msgs.append("체험·활동 옵션이 풍부해요")
+        if not msgs:
+            best = []
+            for k, lab in [("방문자_점유율_norm","방문 수요"),
+                           ("소비_다양성_norm","소비 다양성"),
+                           ("숙박_비중_norm","숙박 인프라"),
+                           ("활동_다양성_norm","활동 다양성")]:
+                best.append((row[k], lab))
+            best = sorted(best, key=lambda x: x[0], reverse=True)[:2]
+            msgs = [f"{lab} 상대적으로 우수" for _, lab in best]
+        return " · ".join(msgs)
 
-# =================== 랭킹/키워드 섹션 ===================
+    q = {
+        "vis_hi": ranked["방문자_점유율_norm"].quantile(0.70),
+        "div_hi": ranked["소비_다양성_norm"].quantile(0.70),
+        "lod_hi": ranked["숙박_비중_norm"].quantile(0.70),
+        "act_hi": ranked["활동_다양성_norm"].quantile(0.70),
+    }
+    top_show = ranked.sort_values("NSI", ascending=False).head(5)
+    for _, r in top_show.iterrows():
+        st.write(f"**{r['지역_norm']}** — {int(r['rank'])}위 · NSI {float(r['NSI']):.3f}")
+        st.caption("· " + region_reasons(r, q))
+
+    # QnA · 게시판
+    st.markdown("### QnA · 게시판")
+    STORE_PATH = os.path.join(DATA_DIR, "community_qna.json")
+
+    def load_store():
+        try:
+            with open(STORE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {"posts": []}
+
+    def save_store(data):
+        try:
+            with open(STORE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    if "qna_store" not in st.session_state:
+        st.session_state.qna_store = load_store()
+    store = st.session_state.qna_store
+
+    tabs = st.tabs(["질문 올리기(QnA)", "글쓰기(게시판)", "피드 보기"])
+    with tabs[0]:
+        with st.form("form_qna"):
+            title = st.text_input("제목", value="")
+            content = st.text_area("내용", height=120, value="")
+            region_tag = st.text_input("관련 지역(선택, 예: 제주·강원)", value=st.session_state.selected_region or "")
+            submit = st.form_submit_button("질문 등록")
+        if submit and title.strip():
+            store["posts"].append({
+                "id": str(uuid.uuid4()), "type": "qna",
+                "title": title.strip(), "content": content.strip(),
+                "region": normalize_region_name(region_tag) if region_tag else "",
+                "author": "익명", "created": int(time.time()), "answers": []
+            })
+            save_store(store); st.success("질문이 등록되었습니다.")
+    with tabs[1]:
+        with st.form("form_board"):
+            title2 = st.text_input("제목 ", value="")
+            content2 = st.text_area("본문", height=140, value="")
+            region_tag2 = st.text_input("지역 태그(선택)", value=st.session_state.selected_region or "")
+            submit2 = st.form_submit_button("글 등록")
+        if submit2 and title2.strip():
+            store["posts"].append({
+                "id": str(uuid.uuid4()), "type": "board",
+                "title": title2.strip(), "content": content2.strip(),
+                "region": normalize_region_name(region_tag2) if region_tag2 else "",
+                "author": "익명", "created": int(time.time()), "comments": []
+            })
+            save_store(store); st.success("글이 등록되었습니다.")
+    with tabs[2]:
+        colf1, colf2 = st.columns([1,1])
+        with colf1:
+            feed_type = st.multiselect("유형", ["qna", "board"], default=["qna", "board"])
+        with colf2:
+            feed_region = st.text_input("지역 필터(부분일치)", value="")
+        posts = [p for p in store["posts"] if p["type"] in feed_type]
+        if feed_region.strip():
+            key = normalize_region_name(feed_region)
+            posts = [p for p in posts if key in normalize_region_name(p.get("region",""))]
+        posts = sorted(posts, key=lambda p: p.get("created", 0), reverse=True)
+        for p in posts:
+            with st.expander(f"[{'QnA' if p['type']=='qna' else '게시글'}] {p['title']}  ·  {p.get('region','') or '전체'}"):
+                st.write(p["content"] or "(내용 없음)")
+                if p["type"] == "qna":
+                    for a in p.get("answers", []):
+                        st.markdown(f"- **답변**: {a['content']}  — _{a.get('author','익명')}_")
+                    with st.form(f"ans_{p['id']}"):
+                        ans = st.text_input("답변 달기", value="")
+                        ans_btn = st.form_submit_button("등록")
+                    if ans_btn and ans.strip():
+                        p.setdefault("answers", []).append({"content": ans.strip(), "author": "익명", "created": int(time.time())})
+                        save_store(store); st.success("답변이 등록되었습니다.")
+                else:
+                    for cmt in p.get("comments", []):
+                        st.markdown(f"- **댓글**: {cmt['content']}  — _{cmt.get('author','익명')}_")
+                    with st.form(f"cmt_{p['id']}"):
+                        cmt = st.text_input("댓글 달기", value="")
+                        cmt_btn = st.form_submit_button("등록")
+                    if cmt_btn and cmt.strip():
+                        p.setdefault("comments", []).append({"content": cmt.strip(), "author": "익명", "created": int(time.time())})
+                        save_store(store); st.success("댓글이 등록되었습니다.")
+
+# ============================ 랭킹/키워드 ============================
 st.subheader("추천 랭킹")
 rec = ranked.sort_values("NSI", ascending=False)[
     ["광역지자체명","NSI","NSI_base","방문자수_합계","방문자_점유율",
      "숙박_지출비중(%)","소비_다양성지수","활동_다양성지수"]
 ]
 st.dataframe(rec.reset_index(drop=True), use_container_width=True)
-st.download_button(
-    "⬇️ 랭킹 CSV 저장",
-    rec.to_csv(index=False).encode("utf-8-sig"),
-    file_name="ranking_by_categories.csv",
-    mime="text/csv"
-)
+st.download_button("⬇️ 랭킹 CSV 저장", rec.to_csv(index=False).encode("utf-8-sig"),
+                   file_name="ranking_by_categories.csv", mime="text/csv")
 
 st.subheader("키워드 · 카테고리 탐색 (업종/유형 검색비중 기반)")
+def safe_categories(series):
+    try:
+        if hasattr(series, "cat"):
+            cats = list(series.cat.categories)
+        else:
+            cats = list(pd.Series(series).dropna().unique())
+    except Exception:
+        cats = []
+    return ["--전체--"] + sorted(map(str, filter(lambda x: x is not None and x == x, cats)))
+
 col1, col2, col3 = st.columns(3)
 with col1:
     st.text_input("지역", st.session_state.selected_region or "", disabled=True)
 with col2:
-    sel_big = st.selectbox(
-        "대분류 선택(업종)",
-        ["--전체--"] + sorted(cat["대분류"].cat.categories.tolist())
-        if hasattr(cat["대분류"], "cat") else ["--전체--"] + sorted(cat["대분류"].dropna().unique().tolist())
-    )
+    sel_big = st.selectbox("대분류 선택(업종)", safe_categories(cat["대분류"]))
 with col3:
     kw = st.text_input("키워드(중분류명 부분 일치)", "")
 
@@ -566,12 +656,7 @@ if st.session_state.selected_region:
         st.dataframe(top_cat, use_container_width=True)
         st.bar_chart(top_cat.set_index("중분류")["중분류_전체비중"])
     with tabs[1]:
-        sel_big2 = st.selectbox(
-            "대분류 선택(유형)",
-            ["--전체--"] + sorted(typ["대분류"].cat.categories.tolist())
-            if hasattr(typ["대분류"], "cat") else ["--전체--"] + sorted(typ["대분류"].dropna().unique().tolist()),
-            key="type_big"
-        )
+        sel_big2 = st.selectbox("대분류 선택(유형)", safe_categories(typ["대분류"]), key="type_big")
         kw2 = st.text_input("키워드(중분류명 부분 일치)", "", key="type_kw")
         top_typ = top_keywords(typ, st.session_state.selected_region, sel_big2, kw2, topn=12)
         st.dataframe(top_typ, use_container_width=True)
@@ -579,12 +664,7 @@ if st.session_state.selected_region:
 else:
     st.info("지도에서 영역을 클릭하거나, 우측 패널·드롭다운을 이용해 지역을 선택하세요.")
 
-# ----------- 상태/경로 디버그(필요시 주석 해제) -----------
-st.caption("📁 데이터/지도 경로 상태")
-st.write(f"- 방문자 수: {file_visitors}  (exists={os.path.exists(file_visitors)})")
-st.write(f"- 업종별: {file_spend_cat}  (exists={os.path.exists(file_spend_cat)})")
-st.write(f"- 유형별: {file_spend_type}  (exists={os.path.exists(file_spend_type)})")
-st.write(f"- GeoJSON: {KOREA_GEOJSON}  (exists={bool(KOREA_GEOJSON and os.path.exists(KOREA_GEOJSON))})")
+
 
 st.markdown("""
 ---

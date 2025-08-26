@@ -191,13 +191,17 @@ total_visitors = max(vis_region["방문자수_합계"].sum(), 1)
 vis_region["방문자_점유율"] = vis_region["방문자수_합계"] / total_visitors
 vis_region["지역_norm"] = vis_region["광역지자체명"].map(normalize_region_name)
 
-# 기본 메트릭(숙박 지출 비중 제외)
+# 기본 메트릭(숙박 지출 비중만 사용 / 기타 지표는 선택적으로 확장 가능)
 metrics_map = vis_region.copy()
 coords_df = pd.DataFrame([{"지역_norm":k,"lat":v[0],"lon":v[1]} for k,v in REGION_COORDS.items()])
 metrics_map = metrics_map.merge(coords_df, on="지역_norm", how="left")
 metrics_map["방문자_점유율_norm"] = minmax(metrics_map["방문자_점유율"].fillna(0))
-# 숙박 컬럼은 생성하지 않고 NSI_base는 방문자만 반영
-metrics_map["NSI_base"] = metrics_map["방문자_점유율_norm"].fillna(0)
+# 숙박 비중(없으면 0 처리) — 다른 소스에서 추가 결합 시 자동 반영되도록 컬럼만 준비
+if "숙박_지출비중(%)" not in metrics_map:
+    metrics_map["숙박_지출비중(%)"] = np.nan
+metrics_map["숙박_비중_norm"] = minmax(metrics_map["숙박_지출비중(%)"].fillna(0))
+# 기본 NSI: 방문자(0.6) + 숙박(0.4)
+metrics_map["NSI_base"] = 0.60*metrics_map["방문자_점유율_norm"] + 0.40*metrics_map["숙박_비중_norm"]
 
 # ==================== 인프라 지표(상가 폴더/ZIP) 통합 ====================
 @st.cache_data(show_spinner=True)
@@ -218,7 +222,6 @@ def build_infra_from_sources(sources):
             dfs.append(df[list(required)].copy())
     elif sources["mode"] == "zip":
         zpath = sources["paths"][0]
-        import zipfile, io
         with zipfile.ZipFile(zpath,"r") as z:
             for name in z.namelist():
                 if not name.lower().endswith(".csv"): continue
@@ -239,12 +242,11 @@ def build_infra_from_sources(sources):
     mid=df["상권업종중분류명"].astype(str)
     sub=df["상권업종소분류명"].astype(str)
     std=df["표준산업분류명"].astype(str)
-
     m_cafe=(sub.str.contains("카페")) | (std.str.contains("커피 전문점"))
     m_conv=(sub.str.contains("편의점")) | (std.str.contains("체인화 편의점"))
-    m_pc=sub.str.contains("PC방")
-    m_laundry=sub.str.contains("세탁소")
-    m_pharmacy=sub.str.contains("약국")
+    m_hotel=sub.str.contains("호텔/리조트"); m_motel=sub.str.contains("여관/모텔"); m_accom_mid=mid.str.contains("숙박")
+    m_pc=sub.str.contains("PC방"); m_laundry=sub.str.contains("세탁소")
+    m_pharm=sub.str.contains("약국")
     m_clinic=mid.str.contains("의원")
     m_hospital=mid.str.contains("병원") | m_clinic | sub.str.contains("치과의원|한의원")
     m_library=mid.str.contains("도서관·사적지")
@@ -254,6 +256,7 @@ def build_infra_from_sources(sources):
         total_places=("시도명","size"),
         cafe_count=("시도명", lambda s:int(m_cafe.loc[s.index].sum())),
         convenience_count=("시도명", lambda s:int(m_conv.loc[s.index].sum())),
+        accommodation_count=("시도명", lambda s:int((m_hotel|m_motel|m_accom_mid).loc[s.index].sum())),
         hospital_count=("시도명", lambda s:int(m_hospital.loc[s.index].sum())),
         pharmacy_count=("시도명", lambda s:int(m_pharmacy.loc[s.index].sum())),
         pc_cafe_count=("시도명", lambda s:int(m_pc.loc[s.index].sum())),
@@ -262,7 +265,7 @@ def build_infra_from_sources(sources):
     ).reset_index()
 
     def per_10k(n,total): total=total.replace(0,np.nan); return (n/total)*10000
-    for col in ["cafe_count","convenience_count","hospital_count",
+    for col in ["cafe_count","convenience_count","accommodation_count","hospital_count",
                 "pharmacy_count","pc_cafe_count","laundry_count","library_museum_count"]:
         agg[col+"_per10k"] = per_10k(agg[col].astype(float), agg["total_places"].astype(float)).round(3)
         v=agg[col].astype(float); rng=v.max()-v.min()
@@ -382,8 +385,9 @@ with left:
 st.sidebar.header("추천 카테고리")
 CATEGORY_OPTIONS = [
     "🔥 현재 인기 지역",
+    "🛏️ 숙박 다양 지역",
     "🚉 교통 좋은 지역",
-    "🏛 공공시설(워킹스페이스) 풍부 지역",
+    "💼 코워킹 인프라 풍부 지역",
     "💰 저렴한 비용",
     "🚀 빠른 인터넷",
 ]
@@ -393,17 +397,17 @@ st.sidebar.markdown("---")
 st.sidebar.caption("주변 인프라 선택")
 cb_infra_cafe    = st.sidebar.checkbox("☕ 카페", value=False)
 cb_infra_conv    = st.sidebar.checkbox("🏪 편의점", value=False)
-# 숙박 체크박스 제거
+cb_infra_accom   = st.sidebar.checkbox("🏨 숙박 시설", value=False)
 cb_infra_hosp    = st.sidebar.checkbox("🏥 병원·의원", value=False)
 cb_infra_pharm   = st.sidebar.checkbox("💊 약국", value=False)
 cb_infra_pc      = st.sidebar.checkbox("🖥️ PC방", value=False)
-cb_infra_laundry = st.sidebar.checkbox("🧺 세탁소", value=False)
+cb_infra_laundry = st.sidebar.checkbox("🧺 세탁", value=False)
 cb_infra_lib     = st.sidebar.checkbox("🏛️ 도서관", value=False)
 
 # 필요시에만 무거운 데이터 로딩
-need_infra  = any([cb_infra_cafe,cb_infra_conv,cb_infra_hosp,cb_infra_pharm,cb_infra_pc,cb_infra_laundry,cb_infra_lib]) or (selected_category=="🏛 공공시설(워킹스페이스) 풍부 지역")
+need_infra  = any([cb_infra_cafe,cb_infra_conv,cb_infra_accom,cb_infra_hosp,cb_infra_pharm,cb_infra_pc,cb_infra_laundry,cb_infra_lib]) or (selected_category=="💼 코워킹 인프라 풍부 지역")
 need_access = (selected_category=="🚉 교통 좋은 지역")
-need_cowork = (selected_category=="🏛 공공시설(워킹스페이스) 풍부 지역")
+need_cowork = (selected_category=="💼 코워킹 인프라 풍부 지역")
 
 if need_infra:
     infra_sources = resolve_infra_sources()
@@ -436,7 +440,7 @@ if need_access:
 if need_cowork:
     cowork_files = [
         "KC_CNRS_OFFM_FCLTY_DATA_2023.csv","공유오피스.csv","coworking_sites.csv",
-        "중소벤처기업진흥공단_공유오피스_운영현황.csv","한국문화정보원_전국공유오피스시설데이터.csv","전국_공유_오피스_시설_데이터.csv"
+        "중소벤처기업진흥공단_공유오피스_운영현황.csv","한국문화정보원_전국공유오피스시설.csv","전국_공유_오피스_시설_데이터.csv"
     ]
     cw_file = find_optional_file(cowork_files)
     cow_df = load_coworking(cw_file)
@@ -459,6 +463,7 @@ def _compute_bonus_columns(g, selected_category):
     CAT_BONUS   = 0.15
     INFRA_BONUS = 0.10
     q_vis_hi = g["방문자_점유율_norm"].quantile(0.70)
+    q_lod_hi = g["숙박_비중_norm"].quantile(0.70)
     q_acc_hi = g["access_score"].quantile(0.70) if "access_score" in g and g["access_score"].notna().any() else 1.0
     q_cwk_hi = g["cowork_norm"].quantile(0.70) if "cowork_norm" in g and g["cowork_norm"].notna().any() else 1.0
 
@@ -470,9 +475,11 @@ def _compute_bonus_columns(g, selected_category):
 
     if selected_category == "🔥 현재 인기 지역":
         bonus += CAT_BONUS * add_above(g["방문자_점유율_norm"], q_vis_hi)
+    elif selected_category == "🛏️ 숙박 다양 지역":
+        bonus += CAT_BONUS * add_above(g["숙박_비중_norm"], q_lod_hi)
     elif selected_category == "🚉 교통 좋은 지역" and "access_score" in g:
         bonus += CAT_BONUS * add_above(g["access_score"], q_acc_hi)
-    elif selected_category == "🏛 공공시설(워킹스페이스) 풍부 지역" and "cowork_norm" in g:
+    elif selected_category == "💼 코워킹 인프라 풍부 지역" and "cowork_norm" in g:
         bonus += CAT_BONUS * add_above(g["cowork_norm"], q_cwk_hi)
     elif selected_category == "💰 저렴한 비용" and "cost_index" in g:
         rng=(g["cost_index"].max()-g["cost_index"].min())+1e-9
@@ -481,16 +488,17 @@ def _compute_bonus_columns(g, selected_category):
         rng=(g["internet_mbps"].max()-g["internet_mbps"].min())+1e-9
         bonus += CAT_BONUS * (((g["internet_mbps"]-g["internet_mbps"].min())/rng)).fillna(0)
 
-    # 인프라 보너스(체크된 항목만) — 숙박 제거
+    # 인프라 보너스(체크된 항목만)
     def has(col): return col in g.columns and pd.api.types.is_numeric_dtype(g[col])
     infra_cols = {
         "cafe":"infra__cafe_count_norm", "conv":"infra__convenience_count_norm",
-        "hosp":"infra__hospital_count_norm", "pharm":"infra__pharmacy_count_norm",
-        "pc":"infra__pc_cafe_count_norm", "laundry":"infra__laundry_count_norm",
-        "lib":"infra__library_museum_count_norm",
+        "accom":"infra__accommodation_count_norm", "hosp":"infra__hospital_count_norm",
+        "pharm":"infra__pharmacy_count_norm", "pc":"infra__pc_cafe_count_norm",
+        "laundry":"infra__laundry_count_norm", "lib":"infra__library_museum_count_norm",
     }
     if cb_infra_cafe    and has(infra_cols["cafe"]):    bonus += INFRA_BONUS * g[infra_cols["cafe"]].fillna(0)
     if cb_infra_conv    and has(infra_cols["conv"]):    bonus += INFRA_BONUS * g[infra_cols["conv"]].fillna(0)
+    if cb_infra_accom   and has(infra_cols["accom"]):   bonus += INFRA_BONUS * g[infra_cols["accom"]].fillna(0)
     if cb_infra_hosp    and has(infra_cols["hosp"]):    bonus += INFRA_BONUS * g[infra_cols["hosp"]].fillna(0)
     if cb_infra_pharm   and has(infra_cols["pharm"]):   bonus += INFRA_BONUS * g[infra_cols["pharm"]].fillna(0)
     if cb_infra_pc      and has(infra_cols["pc"]):      bonus += INFRA_BONUS * g[infra_cols["pc"]].fillna(0)
@@ -510,14 +518,17 @@ def apply_category_rules_all(df):
 def apply_category_rules(df):
     g = df.copy()
     q_vis_hi = g["방문자_점유율_norm"].quantile(0.70)
+    q_lod_hi = g["숙박_비중_norm"].quantile(0.70)
     q_acc_hi = g["access_score"].quantile(0.70) if "access_score" in g and g["access_score"].notna().any() else 1.0
     q_cwk_hi = g["cowork_norm"].quantile(0.70) if "cowork_norm" in g and g["cowork_norm"].notna().any() else 1.0
 
     if selected_category == "🔥 현재 인기 지역":
         mask = (g["방문자_점유율_norm"] >= q_vis_hi)
+    elif selected_category == "🛏️ 숙박 다양 지역":
+        mask = (g["숙박_비중_norm"] >= q_lod_hi)
     elif selected_category == "🚉 교통 좋은 지역" and "access_score" in g:
         mask = (g["access_score"] >= q_acc_hi)
-    elif selected_category == "🏛 공공시설(워킹스페이스) 풍부 지역" and "cowork_norm" in g:
+    elif selected_category == "💼 코워킹 인프라 풍부 지역" and "cowork_norm" in g:
         mask = (g["cowork_norm"] >= q_cwk_hi)
     elif selected_category == "💰 저렴한 비용" and "cost_index" in g:
         mask = (g["cost_index"] <= g["cost_index"].quantile(0.30))
@@ -560,113 +571,292 @@ def pick_color(region_norm, selected_region_norm=None):
 # =============================== 지도 ===============================
 MAP_HEIGHT = 680
 with left:
-    # 🔧 여기가 에러였던 부분: 문자열을 닫고, cartodb 스타일을 정확히 지정
-    m = folium.Map(location=[36.5, 127.8], zoom_start=7, tiles="cartodb positron")
+    m = folium.Map(location=[36.5,127.8], zoom_start=7, tiles="cartodbpositron", prefer_canvas=True)
 
-    # GeoJSON 로드 및 스타일링
-    gj, gj_err = load_geojson_safe(KOREA_GEOJSON)
-    feature_name_cache = {}
+    gj, gj_err = (None, "no_path")
+    if KOREA_GEOJSON and os.path.exists(KOREA_GEOJSON):
+        gj, gj_err = load_geojson_safe(KOREA_GEOJSON)
 
-    def _feature_region_name(feat):
-        props = feat.get("properties", {}) if isinstance(feat, dict) else {}
-        val = ""
-        for k in GEO_PROP_KEYS:
-            if k in props and str(props[k]).strip():
-                val = str(props[k]).strip(); break
-        if not val and "name" in feat:
-            val = str(feat["name"])
-        return normalize_region_name(val)
+    coords_df = pd.DataFrame([{"지역_norm":k,"lat":v[0],"lon":v[1]} for k,v in REGION_COORDS.items()])
+    ranked_all = ranked_all.drop(columns=[c for c in ["lat","lon"] if c in ranked_all.columns]).merge(coords_df, on="지역_norm", how="left")
+    rank_lookup = ranked_all.set_index("지역_norm")[["rank","NSI"]].to_dict("index")
 
-    if gj and "features" in gj:
-        # 스타일
-        def style_fn(feat):
-            rn = _feature_region_name(feat)
-            color = pick_color(rn, selected_norm)
-            return {"color": "#777777", "weight": 1, "fillColor": color, "fillOpacity": 0.65}
+    if gj is not None:
+        for ft in gj.get("features", []):
+            props = ft.get("properties", {}) or {}
+            region_raw=None
+            for k in GEO_PROP_KEYS:
+                if k in props and props[k]: region_raw=props[k]; break
+            if region_raw is None:
+                textish=[str(v) for v in props.values() if isinstance(v,str)]
+                region_raw=max(textish, key=len) if textish else ""
+            rname=normalize_region_name(region_raw)
+            stats=rank_lookup.get(rname)
+            props.update({
+                "REGION_NAME": rname,
+                "RANK_TXT": f"{int(stats['rank'])}위" if stats else "-",
+                "NSI_TXT":  f"{float(stats['NSI']):.3f}" if stats else "-"
+            })
+            ft["properties"]=props
 
-        # 툴팁 데이터 구성
-        tooltip_fields, tooltip_alias = [], []
-        tooltip_style = ("background-color: white; color: #111; "
-                         "font-family: Pretendard, -apple-system, Segoe UI, Roboto, Arial; "
-                         "font-size: 12px; padding: 6px; border: 1px solid #ddd;")
-        # folium의 GeoJsonTooltip은 feature 속성만 바로 쓰므로 custom으로 name을 주입
-        for f in gj["features"]:
-            rn = _feature_region_name(f)
-            feature_name_cache[id(f)] = rn
-            # 지역명만 properties에 안전 주입
-            f.setdefault("properties", {})["_RNORM_"] = rn
+        def style_function(feature):
+            rname = feature["properties"].get("REGION_NAME","")
+            color = pick_color(rname, selected_norm)
+            return {"fillColor":color, "color":color, "weight":1, "fillOpacity":0.70, "opacity":0.9}
 
-        gjson = folium.GeoJson(
-            gj,
-            name="광역시도",
-            style_function=style_fn,
-            highlight_function=lambda x: {"weight": 2, "fillOpacity": 0.85},
-            tooltip=GeoJsonTooltip(
-                fields=["_RNORM_"],
-                aliases=["지역"],
-                sticky=True,
-                style=tooltip_style
-            )
+        def highlight_function(feature):
+            return {"fillOpacity":0.92, "weight":2}
+
+        tooltip_css = (
+            "background-color: rgba(28, 45, 28, 0.92); color: #fff; "
+            "font-size: 12px; padding: 6px 8px; border-radius: 6px; "
+            "white-space: nowrap; border: 0.5px solid rgba(255,255,255,0.15);"
         )
-        gjson.add_to(m)
 
-    # 각 지역 중심점에 원형 마커 + 간단 수치 표시
-    for _, row in ranked_all.iterrows():
-        rn = row["지역_norm"]
-        lat, lon = row.get("lat"), row.get("lon")
-        if pd.isna(lat) or pd.isna(lon): 
-            continue
-        popup_html = f"""
-        <div style="font-size:13px">
-            <b>{rn}</b><br/>
-            방문자 점유율: {row['방문자_점유율']*100:.2f}%<br/>
-            NSI: {row['NSI']:.3f} (랭킹 전체 {int(row['rank'])}위)
-        </div>
-        """
-        folium.CircleMarker(
-            location=(lat, lon),
-            radius=6,
-            color="#333",
-            fill=True,
-            fill_opacity=0.9,
-            fill_color=pick_color(rn, selected_norm),
-            popup=folium.Popup(popup_html, max_width=300),
+        GeoJson(
+            gj,
+            name="regions",
+            style_function=style_function,
+            highlight_function=highlight_function,
+            smooth_factor=1.0,
+            tooltip=GeoJsonTooltip(
+                fields=["REGION_NAME","RANK_TXT","NSI_TXT"],
+                aliases=["지역","랭킹","NSI"],
+                labels=True, sticky=True, style=tooltip_css
+            ),
+            popup=GeoJsonPopup(fields=["REGION_NAME"], labels=False),
         ).add_to(m)
 
-    # Streamlit에 지도 렌더링
-    map_resp = st_folium(m, height=MAP_HEIGHT, use_container_width=True)
+        legend_html = f"""
+        <div style="
+          position: fixed; bottom: 20px; left: 20px; z-index: 9999;
+          background: rgba(255,255,255,0.96); padding: 12px 14px; border-radius: 10px;
+          box-shadow: 0 2px 10px rgba(0,0,0,0.15); font-size: 13px; color: #222;">
+          <div style="font-weight:700; margin-bottom:8px;">랭킹 표기</div>
+          <div style="display:flex; align-items:center; gap:8px; margin:4px 0;">
+            <span style="display:inline-block;width:14px;height:14px;background:{COLOR_TOP1};
+                         border:1px solid rgba(0,0,0,.2);border-radius:3px;"></span><span>1위</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:8px; margin:4px 0;">
+            <span style="display:inline-block;width:14px;height:14px;background:{COLOR_TOP2};
+                         border:1px solid rgba(0,0,0,.2);border-radius:3px;"></span><span>2위</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:8px; margin:4px 0;">
+            <span style="display:inline-block;width:14px;height:14px;background:{COLOR_TOP3};
+                         border:1px solid rgba(0,0,0,.2);border-radius:3px;"></span><span>3위</span>
+          </div>
+        </div>"""
+        m.get_root().html.add_child(folium.Element(legend_html))
+    else:
+        for _, r in ranked_all.iterrows():
+            if pd.isna(r.get("lat")) or pd.isna(r.get("lon")): continue
+            color = pick_color(r["지역_norm"], selected_norm)
+            nsi = float(r["NSI"])
+            text = f"지역&nbsp;&nbsp;{r['지역_norm']}<br>랭킹&nbsp;{int(r['rank'])}위<br>NSI&nbsp;&nbsp;&nbsp;{nsi:.3f}"
+            folium.CircleMarker(
+                location=[r["lat"], r["lon"]], radius=6+14*nsi,
+                color=color, fill=True, fill_color=color,
+                fill_opacity=0.78, opacity=0.95, weight=1
+            ).add_child(folium.Tooltip(text, sticky=True, direction="top")).add_to(m)
 
-# =============================== 오른쪽 패널 ===============================
+    def extract_clicked_name(state):
+        if not state: return None
+        nm = state.get("last_object_clicked_popup")
+        if nm: return normalize_region_name(str(nm))
+        obj = state.get("last_active_drawing") or {}
+        if isinstance(obj, dict):
+            nm = obj.get("properties", {}).get("REGION_NAME")
+            if nm: return normalize_region_name(str(nm))
+        obj = state.get("last_object_clicked") or {}
+        if isinstance(obj, dict):
+            nm = obj.get("popup") or (obj.get("properties", {}) or {}).get("REGION_NAME")
+            if nm: return normalize_region_name(str(nm))
+        return None
+
+    map_state = st_folium(m, width=None, height=MAP_HEIGHT, key="main_map")
+    clicked_name = extract_clicked_name(map_state)
+    if clicked_name and clicked_name != st.session_state.get("_last_clicked"):
+        st.session_state.selected_region = clicked_name
+        st.session_state._last_clicked = clicked_name
+
+# ============================ 우측 패널(커뮤니티 유지) ============================
 with right:
-    st.subheader("추천 순위")
-    show_top_n = st.slider("표시 개수", min_value=3, max_value=17, value=10, step=1)
+    st.subheader("커뮤니티")
+    c1, c2 = st.columns(2)
+    with c1: buddy_on = st.toggle("🧑‍🤝‍🧑 버디 선택", value=False)
+    with c2: tourist_on = st.toggle("🧳 관광객 선택", value=False)
+    st.caption(f"- 버디: **{'참여' if buddy_on else '미참여'}**  |  관광객: **{'참여' if tourist_on else '미참여'}**")
 
-    show_cols = ["지역_norm","rank","NSI","방문자_점유율"]
-    extra_cols = []
-    if "access_score" in metrics_map.columns and selected_category=="🚉 교통 좋은 지역":
-        extra_cols.append("access_score")
-    if "cowork_norm" in metrics_map.columns and selected_category=="🏛 공공시설(워킹스페이스) 풍부 지역":
-        extra_cols += ["coworking_sites","cowork_per10k","cowork_norm"]
-    if any(c in metrics_map.columns for c in ["infra__cafe_count_norm","infra__convenience_count_norm",
-                                              "infra__hospital_count_norm","infra__pharmacy_count_norm",
-                                              "infra__pc_cafe_count_norm","infra__laundry_count_norm",
-                                              "infra__library_museum_count_norm"]):
-        # 인프라 관련 정규화 점수 요약(체크한 항목만 보임)
-        if cb_infra_cafe and "infra__cafe_count_norm" in metrics_map: extra_cols.append("infra__cafe_count_norm")
-        if cb_infra_conv and "infra__convenience_count_norm" in metrics_map: extra_cols.append("infra__convenience_count_norm")
-        if cb_infra_hosp and "infra__hospital_count_norm" in metrics_map: extra_cols.append("infra__hospital_count_norm")
-        if cb_infra_pharm and "infra__pharmacy_count_norm" in metrics_map: extra_cols.append("infra__pharmacy_count_norm")
-        if cb_infra_pc and "infra__pc_cafe_count_norm" in metrics_map: extra_cols.append("infra__pc_cafe_count_norm")
-        if cb_infra_laundry and "infra__laundry_count_norm" in metrics_map: extra_cols.append("infra__laundry_count_norm")
-        if cb_infra_lib and "infra__library_museum_count_norm" in metrics_map: extra_cols.append("infra__library_museum_count_norm")
+    st.markdown("### 지역 하이라이트")
+    def region_reasons(row, q):
+        msgs=[]
+        if row.get("방문자_점유율_norm",0) >= q["vis_hi"]: msgs.append("방문 수요가 높아요")
+        if row.get("숙박_비중_norm",0)     >= q["lod_hi"]: msgs.append("숙박 인프라가 잘 갖춰져요")
+        if "access_score" in row and pd.notna(row["access_score"]) and row["access_score"] >= q["acc_hi"]:
+            msgs.append("교통 접근성이 좋아요")
+        if "cowork_norm" in row and pd.notna(row["cowork_norm"]) and row["cowork_norm"] >= q["cwk_hi"]:
+            msgs.append("코워킹 인프라가 발달했어요")
+        if not msgs:
+            best=[]
+            for k, lab in [("방문자_점유율_norm","방문 수요"),("숙박_비중_norm","숙박 인프라"),
+                           ("access_score","교통 접근성"),("cowork_norm","코워킹 인프라")]:
+                if k in row: best.append((row[k] if pd.notna(row[k]) else -1, lab))
+            best=sorted(best, key=lambda x:x[0], reverse=True)[:2]
+            msgs=[f"{lab} 상대적으로 우수" for _,lab in best]
+        return " · ".join(msgs)
 
-    table = (ranked.sort_values(["rank","NSI"], ascending=[True, False])
-                  [show_cols + extra_cols]
-                  .head(show_top_n)
-                  .rename(columns={"지역_norm":"지역","NSI":"종합점수","방문자_점유율":"방문자 점유율"}))
-    table["방문자 점유율"] = (table["방문자 점유율"]*100).round(2)
+    q = {
+        "vis_hi": ranked_all["방문자_점유율_norm"].quantile(0.70),
+        "lod_hi": ranked_all["숙박_비중_norm"].quantile(0.70),
+        "acc_hi": ranked_all["access_score"].quantile(0.70) if "access_score" in ranked_all and ranked_all["access_score"].notna().any() else 1.0,
+        "cwk_hi": ranked_all["cowork_norm"].quantile(0.70) if "cowork_norm" in ranked_all and ranked_all["cowork_norm"].notna().any() else 1.0,
+    }
 
-    st.dataframe(table, use_container_width=True)
+    if st.session_state.selected_region:
+        sel = ranked_all.loc[ranked_all["지역_norm"]==normalize_region_name(st.session_state.selected_region)]
+        if not sel.empty:
+            r=sel.iloc[0]
+            st.write(f"**{r['지역_norm']}** — {int(r['rank'])}위 · NSI {float(r['NSI']):.3f}")
+            st.caption("· " + region_reasons(r, q))
+    else:
+        for _, r in ranked_all.sort_values("NSI", ascending=False).head(5).iterrows():
+            st.write(f"**{r['지역_norm']}** — {int(r['rank'])}위 · NSI {float(r['NSI']):.3f}")
+            st.caption("· " + region_reasons(r, q))
 
-    st.markdown("---")
-    st.caption("Tip: 왼쪽 지도는 상위 1~3위에 색상을 강조합니다. 사이드바에서 카테고리/인프라를 바꿔 다양한 추천을 확인하세요.")
+    # QnA/게시판(간단)
+    st.markdown("### QnA · 게시판")
+    STORE_PATH = os.path.join(DATA_DIR, "community_qna.json")
+    def load_store():
+        try:
+            with open(STORE_PATH,"r",encoding="utf-8") as f: return json.load(f)
+        except Exception: return {"posts":[]}
+    def save_store(data):
+        try:
+            with open(STORE_PATH,"w",encoding="utf-8") as f: json.dump(data,f,ensure_ascii=False,indent=2)
+        except Exception: pass
+    if "qna_store" not in st.session_state: st.session_state.qna_store = load_store()
+    store = st.session_state.qna_store
+
+    tabs = st.tabs(["질문 올리기(QnA)", "글쓰기(게시판)", "피드 보기"])
+    with tabs[0]:
+        with st.form("form_qna"):
+            title = st.text_input("제목", value="")
+            content = st.text_area("내용", height=120, value="")
+            region_tag = st.text_input("관련 지역(선택, 예: 제주·강원)", value=st.session_state.selected_region or "")
+            submit = st.form_submit_button("질문 등록")
+        if submit and title.strip():
+            store["posts"].append({
+                "id": str(uuid.uuid4()), "type":"qna",
+                "title": title.strip(), "content": content.strip(),
+                "region": normalize_region_name(region_tag) if region_tag else "",
+                "author":"익명", "created": int(time.time()), "answers":[]
+            }); 
+            save_store(store); st.success("질문이 등록되었습니다.")
+    with tabs[1]:
+        with st.form("form_board"):
+            title2 = st.text_input("제목 ", value="")
+            content2 = st.text_area("본문", height=140, value="")
+            region_tag2 = st.text_input("지역 태그(선택)", value=st.session_state.selected_region or "")
+            submit2 = st.form_submit_button("글 등록")
+        if submit2 and title2.strip():
+            store["posts"].append({
+                "id": str(uuid.uuid4()), "type":"board",
+                "title": title2.strip(), "content": content2.strip(),
+                "region": normalize_region_name(region_tag2) if region_tag2 else "",
+                "author":"익명", "created": int(time.time()), "comments":[]
+            })
+            save_store(store); st.success("글이 등록되었습니다.")
+    with tabs[2]:
+        c1, c2 = st.columns([1,1])
+        with c1: feed_type = st.multiselect("유형", ["qna","board"], default=["qna","board"])
+        with c2: feed_region = st.text_input("지역 필터(부분일치)", value="")
+        posts=[p for p in store["posts"] if p["type"] in feed_type]
+        if feed_region.strip():
+            key=normalize_region_name(feed_region)
+            posts=[p for p in posts if key in normalize_region_name(p.get("region",""))]
+        posts=sorted(posts, key=lambda p:p.get("created",0), reverse=True)
+        for p in posts:
+            with st.expander(f"[{'QnA' if p['type']=='qna' else '게시글'}] {p['title']}  ·  {p.get('region','') or '전체'}"):
+                st.write(p["content"] or "(내용 없음)")
+                if p["type"]=="qna":
+                    for a in p.get("answers", []):
+                        st.markdown(f"- **답변**: {a['content']}  — _{a.get('author','익명')}_")
+                    with st.form(f"ans_{p['id']}"):
+                        ans = st.text_input("답변 달기", value="")
+                        if st.form_submit_button("등록") and ans.strip():
+                            p.setdefault("answers",[]).append({"content":ans.strip(),"author":"익명","created":int(time.time())})
+                            save_store(store); st.success("답변이 등록되었습니다.")
+                else:
+                    for cmt in p.get("comments", []):
+                        st.markdown(f"- **댓글**: {cmt['content']}  — _{cmt.get('author','익명')}_")
+                    with st.form(f"cmt_{p['id']}"):
+                        cmt = st.text_input("댓글 달기", value="")
+                        if st.form_submit_button("등록") and cmt.strip():
+                            p.setdefault("comments",[]).append({"content":cmt.strip(),"author":"익명","created":int(time.time())})
+                            save_store(store); st.success("댓글이 등록되었습니다.")
+
+# ============================ 랭킹/다운로드 ============================
+st.subheader("추천 랭킹")
+cols_to_show = ["광역지자체명","NSI","NSI_base","방문자수_합계","방문자_점유율","숙박_지출비중(%)"]
+if "access_score" in metrics_map.columns and metrics_map["access_score"].notna().any():
+    cols_to_show += ["access_score","ktx_cnt"]
+if "coworking_sites" in metrics_map.columns:
+    cols_to_show += ["coworking_sites","cowork_per10k"]
+if not infra_df.empty:
+    cols_to_show += [
+        "infra__cafe_count_per10k","infra__convenience_count_per10k","infra__accommodation_count_per10k",
+        "infra__hospital_count_per10k","infra__pharmacy_count_per10k"
+    ]
+rec = metrics_after_rules.sort_values("NSI", ascending=False)[[c for c in cols_to_show if c in metrics_after_rules.columns]]
+out = rec.copy()
+if "방문자수_합계" in out.columns: out["방문자수_합계"] = out["방문자수_합계"].fillna(0).astype(int)
+for c in out.columns:
+    if c not in ["광역지자체명"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").round(4)
+st.dataframe(rec.reset_index(drop=True), use_container_width=True)
+st.download_button("⬇️ 랭킹 CSV 저장", out.to_csv(index=False).encode("utf-8-sig"),
+                   file_name="ranking_full.csv", mime="text/csv")
+
+# ============================ 키워드 · 카테고리 탐색(그래프) ============================
+st.markdown("## 키워드 · 카테고리 탐색")
+search_cat_df, search_cat_cols   = load_search_counts(file_search_cat)   # 업종/카테고리 검색건수
+search_type_df, search_type_cols = load_search_counts(file_search_type)  # 유형/키워드   검색건수
+
+def render_search_chart(df, cols, title_key, default_regions=None, key_prefix="cat"):
+    rcol, gcol, vcol = cols
+    if df.empty or not (rcol and gcol and vcol):
+        st.info("검색건수 데이터를 불러오지 못했습니다. (파일 또는 컬럼 확인)")
+        return
+    regions = sorted(df[rcol].dropna().astype(str).map(normalize_region_name).unique().tolist())
+    if not regions:
+        st.info("지역 목록이 비어 있습니다.")
+        return
+    with st.container():
+        c1, c2 = st.columns([2,1])
+        with c1:
+            pick_regions = st.multiselect("지역 선택", options=regions,
+                                          default=default_regions or regions, key=f"{key_prefix}_regions")
+        with c2:
+            topn = st.slider("상위 N", min_value=5, max_value=30, value=12, step=1, key=f"{key_prefix}_topn")
+        temp = df.copy()
+        temp["_지역_"] = temp[rcol].astype(str).map(normalize_region_name)
+        temp = temp[temp["_지역_"].isin(pick_regions)]
+        grp = (temp.groupby(gcol, as_index=False)[vcol].sum()
+                    .sort_values(vcol, ascending=False).head(topn))
+        st.bar_chart(grp.set_index(gcol)[vcol])
+
+tabs_kc = st.tabs(["업종/카테고리 검색건수", "유형/키워드 검색건수"])
+with tabs_kc[0]:
+    render_search_chart(search_cat_df, search_cat_cols, "카테고리", key_prefix="scat")
+with tabs_kc[1]:
+    render_search_chart(search_type_df, search_type_cols, "키워드", key_prefix="stype")
+
+# ----------------------------- 출처 -----------------------------
+st.markdown("""
+---
+**데이터 출처**  
+- 한국관광데이터랩: 지역별 방문자수, 지역별 관광지출액, 지역별 검색건수, 인기관광지 현황  
+- 소상공인시장진흥공단: 상가(상권) 정보  
+- 한국철도공사: KTX 노선별 역정보  
+- 한국문화정보원: 전국공유오피스시설데이터
+""")

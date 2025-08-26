@@ -152,8 +152,6 @@ def read_csv_forgiving(path, usecols=None, dtype=None):
 
 @st.cache_data(show_spinner=False)
 def read_visitors():
-    if not os.path.exists(file_visitors):
-        return pd.DataFrame(columns=NEEDED_VIS_COLS)
     return read_csv_forgiving(file_visitors, usecols=NEEDED_VIS_COLS, dtype={"광역지자체명":"string"})
 
 # ----- (그래프용) 검색건수 파일 로더: 유연 컬럼 감지 -----
@@ -185,163 +183,99 @@ def load_search_counts(path):
 vis = read_visitors()
 
 # 방문자 집계/정규화
-if vis.empty:
-    vis_region = pd.DataFrame(columns=["광역지자체명","방문자수_합계","방문자_점유율","지역_norm"])
-else:
-    vis_region = (vis.groupby("광역지자체명", as_index=False)["기초지자체 방문자 수"]
-                    .sum()
-                    .rename(columns={"기초지자체 방문자 수":"방문자수_합계"}))
-    total_visitors = max(vis_region["방문자수_합계"].sum(), 1)
-    vis_region["방문자_점유율"] = vis_region["방문자수_합계"] / total_visitors
-    vis_region["지역_norm"] = vis_region["광역지자체명"].map(normalize_region_name)
+vis_region = (vis.groupby("광역지자체명", as_index=False)["기초지자체 방문자 수"]
+                .sum()
+                .rename(columns={"기초지자체 방문자 수":"방문자수_합계"}))
+total_visitors = max(vis_region["방문자수_합계"].sum(), 1)
+vis_region["방문자_점유율"] = vis_region["방문자수_합계"] / total_visitors
+vis_region["지역_norm"] = vis_region["광역지자체명"].map(normalize_region_name)
 
 # 기본 메트릭(숙박 제외): 방문자만 반영
 metrics_map = vis_region.copy()
 coords_df = pd.DataFrame([{"지역_norm":k,"lat":v[0],"lon":v[1]} for k,v in REGION_COORDS.items()])
 metrics_map = metrics_map.merge(coords_df, on="지역_norm", how="left")
-if "방문자_점유율" in metrics_map:
-    metrics_map["방문자_점유율_norm"] = minmax(metrics_map["방문자_점유율"].fillna(0))
-else:
-    metrics_map["방문자_점유율_norm"] = 0.0
+metrics_map["방문자_점유율_norm"] = minmax(metrics_map["방문자_점유율"].fillna(0))
 metrics_map["NSI_base"] = metrics_map["방문자_점유율_norm"].fillna(0)
 
 # ==================== 인프라 지표(상가 폴더/ZIP) 통합 ====================
 @st.cache_data(show_spinner=True)
 def build_infra_from_sources(sources):
     import io, zipfile
-    required_any = {"시도명","상권업종중분류명","상권업종소분류명","표준산업분류명"}
+    required = {"시도명","상권업종중분류명","상권업종소분류명","표준산업분류명"}
     dfs = []
-
-    def read_csv_bytes(raw):
-        for enc in ["cp949","utf-8","euc-kr","latin1","utf-8-sig"]:
-            try:
-                return pd.read_csv(io.BytesIO(raw), encoding=enc, low_memory=False)
-            except Exception:
-                continue
-        return None
-
-    def read_csv_path(path):
-        for enc in ["cp949","utf-8","euc-kr","latin1","utf-8-sig"]:
-            try:
-                return pd.read_csv(path, encoding=enc, low_memory=False)
-            except Exception:
-                continue
-        return None
-
     if sources["mode"] == "dir":
         for path in sources["paths"]:
-            df = read_csv_path(path)
-            if df is None: 
+            df=None
+            for enc in ["cp949","utf-8","euc-kr","latin1"]:
+                try:
+                    df=pd.read_csv(path, encoding=enc, low_memory=False); break
+                except Exception:
+                    df=None
+            if df is None or not required.issubset(set(df.columns)): 
                 continue
-            cols = set(df.columns)
-            if not required_any.issubset(cols): 
-                continue
-            dfs.append(df[list(required_any)].copy())
-
+            dfs.append(df[list(required)].copy())
     elif sources["mode"] == "zip":
         zpath = sources["paths"][0]
         with zipfile.ZipFile(zpath,"r") as z:
             for name in z.namelist():
-                if not name.lower().endswith(".csv"): 
+                if not name.lower().endswith(".csv"): continue
+                raw=z.read(name); df=None
+                for enc in ["cp949","utf-8","euc-kr","latin1"]:
+                    try:
+                        df=pd.read_csv(io.BytesIO(raw), encoding=enc, low_memory=False); break
+                    except Exception:
+                        df=None
+                if df is None or not required.issubset(set(df.columns)): 
                     continue
-                raw = z.read(name)
-                df = read_csv_bytes(raw)
-                if df is None: 
-                    continue
-                cols = set(df.columns)
-                if not required_any.issubset(cols): 
-                    continue
-                dfs.append(df[list(required_any)].copy())
+                dfs.append(df[list(required)].copy())
+    if not dfs: return pd.DataFrame()
 
-    if not dfs: 
-        return pd.DataFrame()
+    df=pd.concat(dfs, ignore_index=True)
+    for c in required: df[c]=df[c].astype(str).str.strip()
 
-    df = pd.concat(dfs, ignore_index=True)
-    for c in required_any:
-        df[c] = df[c].astype(str).str.strip()
+    mid=df["상권업종중분류명"].astype(str)
+    sub=df["상권업종소분류명"].astype(str)
+    std=df["표준산업분류명"].astype(str)
 
-    mid = df["상권업종중분류명"].astype(str)
-    sub = df["상권업종소분류명"].astype(str)
-    std = df["표준산업분류명"].astype(str)
+    # ---- 최종 분류(키워드) ----
+    m_cafe      = (sub.str.contains("카페")) | (std.str.contains("커피 전문점"))
+    m_conv      = (sub.str.contains("편의점")) | (std.str.contains("체인화 편의점"))
+    m_laundry   = sub.str.contains("세탁소|빨래방")
+    m_pharmacy  = sub.str.contains("약국")
+    m_clinic    = mid.str.contains("의원")
+    m_hospital  = mid.str.contains("병원") | m_clinic | sub.str.contains("치과의원|한의원")
+    m_library   = mid.str_contains("도서관·사적지") if hasattr(mid, "str_contains") else mid.str.contains("도서관·사적지")
+    m_pc        = sub.str.contains("PC방")
+    m_karaoke   = sub.str.contains("노래방|노래연습장")
+    m_fitness   = sub.str.contains("헬스장")
+    m_yoga      = sub.str.contains("요가|필라테스")
 
-    # --------- 최종 인프라 분류 매핑(요청안) ----------
-    # 의료
-    m_pharmacy = sub.str.contains("약국", na=False) | std.str.contains("약국", na=False)
-    m_clinic_any = (
-        mid.str.contains("의원", na=False) |
-        sub.str.contains("의원|치과의원|한의원", na=False) |
-        std.str.contains("의원|치과의원|한의원", na=False)
-    )
-    m_clinic_specs = sub.str.contains("내과|외과|피부과|비뇨기|비뇨의학|가정의학|소아|정형외|정형외과|이비인후과|안과", na=False) | \
-                     std.str.contains("내과|외과|피부과|비뇨기|비뇨의학|가정의학|소아|정형외|이비인후과|안과", na=False)
-    m_hospital = mid.str.contains("병원", na=False) | sub.str.contains("종합병원|병원|요양병원", na=False) | std.str.contains("종합병원|병원|요양병원", na=False)
-    m_med_similar = std.str.contains("의료|보건|요양원|요양시설|재활", na=False) & (~m_hospital) & (~m_clinic_any) & (~m_pharmacy)
-
-    # 편의
-    m_conv = sub.str.contains("편의점", na=False) | std.str.contains("편의점", na=False)
-    m_laundry = sub.str.contains("세탁소|빨래방", na=False) | std.str.contains("세탁소|빨래방", na=False)
-    m_super = sub.str.contains("슈퍼|마트", na=False) | std.str.contains("슈퍼|마트|대형마트|슈퍼마켓", na=False)
-    m_gas   = sub.str.contains("주유소", na=False) | std.str.contains("주유소", na=False)
-
-    # 공공(워킹스페이스)
-    m_cafe  = sub.str.contains("카페", na=False) | std.str.contains("커피 전문점|카페", na=False)
-    m_lib   = sub.str.contains("도서관|독서실|스터디", na=False) | mid.str.contains("도서관|사적지", na=False) | std.str.contains("도서관|독서실|스터디", na=False)
-
-    # 여가/운동
-    m_fitness = sub.str.contains("헬스장", na=False) | std.str.contains("체력단련|헬스", na=False)
-    m_yoga    = sub.str.contains("요가|필라테스", na=False) | std.str.contains("요가|필라테스", na=False)
-    m_pc      = sub.str.contains("PC방|피시방|피시 룸", na=False) | std.str.contains("PC방", na=False)
-    m_karaoke = sub.str.contains("노래방|노래연습장", na=False) | std.str.contains("노래 연습장|노래방", na=False)
-
-    df["sido_norm"] = df["시도명"].map(normalize_region_name)
-
-    agg = df.groupby("sido_norm").agg(
+    df["sido_norm"]=df["시도명"].map(normalize_region_name)
+    agg=df.groupby("sido_norm").agg(
         total_places=("시도명","size"),
-
-        # 의료
-        pharmacy_count=("시도명", lambda s: int(m_pharmacy.loc[s.index].sum())),
-        clinic_count=("시도명",  lambda s: int((m_clinic_any | m_clinic_specs).loc[s.index].sum())),
-        hospital_count=("시도명", lambda s: int(m_hospital.loc[s.index].sum())),
-        medical_similar_count=("시도명", lambda s: int(m_med_similar.loc[s.index].sum())),
-
-        # 편의
-        convenience_count=("시도명", lambda s: int(m_conv.loc[s.index].sum())),
-        laundry_count=("시도명", lambda s: int(m_laundry.loc[s.index].sum())),
-        supermarket_count=("시도명", lambda s: int(m_super.loc[s.index].sum())),
-        gas_station_count=("시도명", lambda s: int(m_gas.loc[s.index].sum())),
-
-        # 공공(워킹스페이스)
-        cafe_count=("시도명", lambda s: int(m_cafe.loc[s.index].sum())),
-        library_study_count=("시도명", lambda s: int(m_lib.loc[s.index].sum())),
-
-        # 여가/운동
-        fitness_count=("시도명", lambda s: int(m_fitness.loc[s.index].sum())),
-        yoga_pilates_count=("시도명", lambda s: int(m_yoga.loc[s.index].sum())),
-        pc_cafe_count=("시도명", lambda s: int(m_pc.loc[s.index].sum())),
-        karaoke_count=("시도명", lambda s: int(m_karaoke.loc[s.index].sum())),
+        cafe_count=("시도명",             lambda s:int(m_cafe.loc[s.index].sum())),
+        convenience_count=("시도명",      lambda s:int(m_conv.loc[s.index].sum())),
+        laundry_count=("시도명",          lambda s:int(m_laundry.loc[s.index].sum())),
+        pharmacy_count=("시도명",         lambda s:int(m_pharmacy.loc[s.index].sum())),
+        hospital_count=("시도명",         lambda s:int(m_hospital.loc[s.index].sum())),
+        library_museum_count=("시도명",   lambda s:int(m_library.loc[s.index].sum())),
+        pc_cafe_count=("시도명",          lambda s:int(m_pc.loc[s.index].sum())),
+        karaoke_count=("시도명",          lambda s:int(m_karaoke.loc[s.index].sum())),
+        fitness_count=("시도명",          lambda s:int(m_fitness.loc[s.index].sum())),
+        yoga_pilates_count=("시도명",     lambda s:int(m_yoga.loc[s.index].sum())),
     ).reset_index()
 
-    def per_10k(n,total): 
-        total = total.replace(0,np.nan)
-        return (n/total)*10000
+    def per_10k(n,total): total=total.replace(0,np.nan); return (n/total)*10000
 
     metric_cols = [
-        # 의료
-        "pharmacy_count","clinic_count","hospital_count","medical_similar_count",
-        # 편의
-        "convenience_count","laundry_count","supermarket_count","gas_station_count",
-        # 공공
-        "cafe_count","library_study_count",
-        # 여가/운동
-        "fitness_count","yoga_pilates_count","pc_cafe_count","karaoke_count"
+        "cafe_count","convenience_count","laundry_count","pharmacy_count",
+        "hospital_count","library_museum_count","pc_cafe_count",
+        "karaoke_count","fitness_count","yoga_pilates_count"
     ]
-
     for col in metric_cols:
         agg[col+"_per10k"] = per_10k(agg[col].astype(float), agg["total_places"].astype(float)).round(3)
-        v = agg[col].astype(float)
-        rng = v.max() - v.min()
-        agg[col+"_norm"] = ((v - v.min())/rng).fillna(0).round(4) if rng>0 else (v*0)
-
+        v=agg[col].astype(float); rng=v.max()-v.min()
+        agg[col+"_norm"] = ((v-v.min())/rng).fillna(0).round(4) if rng>0 else v*0
     return agg
 
 # ==================== 교통 접근성 + KTX ====================
@@ -453,24 +387,25 @@ left, right = st.columns([2, 1])
 with left:
     st.subheader("지도에서 지역을 선택하세요")
 
-# -------- 사이드바 --------
+# -------- 사이드바: 카테고리 단일 선택(드롭박스) --------
 st.sidebar.header("추천 카테고리")
 CATEGORY_OPTIONS = [
     "🔥 현재 인기 지역",
     "🚉 교통 좋은 지역",
     "🏛 코워킹 인프라 풍부 지역",
-    "💰 합리적인 비용",
+    "💰 합리적인인 비용",
     "🚀 빠른 인터넷",
 ]
 selected_category = st.sidebar.selectbox("하나만 선택", CATEGORY_OPTIONS, index=0)
 
 st.sidebar.markdown("---")
-use_infra = st.sidebar.toggle("인프라 지표 활용(상가 데이터)", value=True)
-need_access = (selected_category == "🚉 교통 좋은 지역")
-need_cowork = (selected_category == "🏛 코워킹 인프라 풍부 지역")
-need_infra = use_infra or need_cowork  # 코워킹 지표 계산에 필요
+st.sidebar.caption("주변 인프라 선택")
+# 공공시설(워킹스페이스)
+cb_infra_cafe    = st.sidebar.checkbox("☕ 카페", value=False)
+cb_infra_lib     = st.sidebar.checkbox("🏛️ 도서관", value=False라 풍부 지역")
+need_access = (selected_category=="🚉 교통 좋은 지역")
+need_cowork = (selected_category=="🏛 코워킹 인프라 풍부 지역")
 
-# 인프라 적재
 if need_infra:
     infra_sources = resolve_infra_sources()
     infra_df = build_infra_from_sources(infra_sources)
@@ -482,7 +417,6 @@ if need_infra:
 else:
     infra_df = pd.DataFrame()
 
-# 교통/코워킹 적재
 if need_access:
     TRANSPORT_FILE = find_optional_file(["transport_access.csv","교통접근성.csv"])
     transport_df = load_transport(TRANSPORT_FILE)
@@ -521,76 +455,42 @@ if need_cowork:
         cow["cowork_norm"]=((v-v.min())/rng).fillna(0) if rng>0 else (v*0)
         metrics_map = metrics_map.merge(cow[["지역_norm","coworking_sites","cowork_per10k","cowork_norm"]], on="지역_norm", how="left")
 
-# ----------------------------- 카테고리 룰/보너스 -----------------------------
-def _compute_bonus_columns(g: pd.DataFrame, selected_category: str) -> np.ndarray:
-    """
-    선택 카테고리에 따라 NSI 보너스를 계산해 반환.
-    """
-    CAT_BONUS = 0.15  # 카테고리 가중
-    # 상위 30% 이상에서만 보너스 기울기 적용
-    def add_above(series):
-        s = pd.to_numeric(series, errors="coerce").fillna(0)
-        q = s.quantile(0.70)
-        return (s - q).clip(lower=0) / max((s.max()-q), 1e-9)
+# ----------------------------- 룰/보너스 -----------------------------
+def _compute_bonus_columns(g, selected_category):
+    CAT_BONUS   = 0.15
+    INFRA_BONUS = 0.10
+    q_vis_hi = g["방문자_점유율_norm"].quantile(0.70)
+    q_acc_hi = g["access_score"].quantile(0.70) if "access_score" in g and g["access_score"].notna().any() else 1.0
+    q_cwk_hi = g["cowork_norm"].quantile(0.70) if "cowork_norm" in g and g["cowork_norm"].notna().any() else 1.0
 
     bonus = np.zeros(len(g), dtype=float)
 
+    def add_above(series, q):
+        s=pd.to_numeric(series, errors="coerce").fillna(0)
+        return (s - q).clip(lower=0)
+
     if selected_category == "🔥 현재 인기 지역":
-        bonus += CAT_BONUS * add_above(g.get("방문자_점유율_norm", 0))
-    elif selected_category == "🚉 교통 좋은 지역":
-        if "access_score" in g:
-            bonus += CAT_BONUS * add_above(g["access_score"])
-    elif selected_category == "🏛 코워킹 인프라 풍부 지역":
-        if "cowork_norm" in g:
-            bonus += CAT_BONUS * add_above(g["cowork_norm"])
-    elif selected_category == "💰 합리적인 비용":
-        # 비용이 낮을수록 유리 (cost_index 낮음 = 좋음). 데이터가 있다면 적용.
-        if "cost_index" in g:
-            s = pd.to_numeric(g["cost_index"], errors="coerce")
-            inv = 1 - (s - s.min())/max((s.max()-s.min()),1e-9)
-            q = inv.quantile(0.70)
-            bonus += CAT_BONUS * (inv - q).clip(lower=0) / max((inv.max()-q),1e-9)
-    elif selected_category == "🚀 빠른 인터넷":
-        if "internet_mbps" in g:
-            bonus += CAT_BONUS * add_above(g["internet_mbps"])
+        bonus += CAT_BONUS * add_above(g["방문자_점유율_norm"], q_vis_hi)
+    elif selected_category == "🚉 교통 좋은 지역" and "access_score" in g:
+        bonus += CAT_BONUS * add_above(g["access_score"], q_acc_hi)
+    elif selected_category == "🏛 코워킹 인프라 풍부 지역" and "cowork_norm" in g:
+        bonus += CAT_BONUS * add_above(g["cowork_norm"], q_cwk_hi)
+    elif selected_category == "💰 합리적인인 비용" and "cost_index" in g:
+        rng=(g["cost_index"].max()-g["cost_index"].min())+1e-9
+        bonus += CAT_BONUS * (1 - 용" and "cost_index" in g:
+        mask = (g["cost_index"] <= g["cost_index"].quantile(0.30))
+    elif selected_category == "🚀 빠른 인터넷" and "internet_mbps" in g:
+        mask = (g["internet_mbps"] >= g["internet_mbps"].quantile(0.70))
+    else:
+        mask = pd.Series(True, index=g.index)
 
-    # 인프라 사용 시, 인프라의 폭넓은 가용성에 소폭 가산(균등)
-    if any(c.startswith("infra__") and c.endswith("_norm") for c in g.columns):
-        infra_norm_cols = [c for c in g.columns if c.startswith("infra__") and c.endswith("_norm")]
-        if infra_norm_cols:
-            infra_avg = pd.concat([pd.to_numeric(g[c], errors="coerce").fillna(0) for c in infra_norm_cols], axis=1).mean(axis=1)
-            bonus += 0.10 * infra_avg  # INFRA_BONUS
+    g = g.loc[mask].copy()
+    bonus = _compute_bonus_columns(g, selected_category)
+    g["NSI"] = (g["NSI_base"] + bonus).clip(0,1)
+    return g
 
-    return bonus
-
-def apply_category_rules_all(g: pd.DataFrame, selected_category: str) -> pd.DataFrame:
-    """
-    전체 지역에 대해 NSI를 계산(툴팁/지도용). 필터링은 하지 않음.
-    """
-    x = g.copy()
-    bonus = _compute_bonus_columns(x, selected_category)
-    x["NSI"] = (x["NSI_base"].fillna(0) + bonus).clip(0,1)
-    return x
-
-def apply_category_rules(g: pd.DataFrame, selected_category: str) -> pd.DataFrame:
-    """
-    카테고리에 맞는 최소 조건을 걸고(NSI/보조지표 기준) NSI를 계산(목록/색상용).
-    """
-    x = g.copy()
-
-    # 기본 필터
-    if selected_category == "💰 합리적인 비용" and "cost_index" in x:
-        x = x[pd.to_numeric(x["cost_index"], errors="coerce") <= pd.to_numeric(x["cost_index"], errors="coerce").quantile(0.30)].copy()
-    elif selected_category == "🚀 빠른 인터넷" and "internet_mbps" in x:
-        x = x[pd.to_numeric(x["internet_mbps"], errors="coerce") >= pd.to_numeric(x["internet_mbps"], errors="coerce").quantile(0.70)].copy()
-    # 다른 카테고리는 보너스 기반으로만 정렬
-
-    bonus = _compute_bonus_columns(x, selected_category)
-    x["NSI"] = (x["NSI_base"].fillna(0) + bonus).clip(0,1)
-    return x
-
-metrics_all = apply_category_rules_all(metrics_map, selected_category)     # 전체용(툴팁)
-metrics_after_rules = apply_category_rules(metrics_map, selected_category) # 목록/색상용
+metrics_all = apply_category_rules_all(metrics_map)     # 전체용(툴팁)
+metrics_after_rules = apply_category_rules(metrics_map) # 필터링 목록/색상용
 
 # ----------------------------- 랭킹 계산 -----------------------------
 if "selected_region" not in st.session_state:
@@ -602,8 +502,6 @@ ranked_all["NSI"]  = ranked_all["NSI"].fillna(ranked_all["NSI_base"]).fillna(0.0
 ranked_all["rank"] = ranked_all["NSI"].rank(ascending=False, method="min").astype(int)
 
 ranked = metrics_after_rules.copy()
-if ranked.empty:
-    ranked = ranked_all.copy()
 ranked["NSI"]  = ranked["NSI"].fillna(ranked["NSI_base"]).fillna(0.0).clip(0,1)
 ranked["rank"] = ranked["NSI"].rank(ascending=False, method="min").astype(int)
 
@@ -697,7 +595,6 @@ with left:
         </div>"""
         m.get_root().html.add_child(folium.Element(legend_html))
     else:
-        # GeoJSON이 없으면 점 표기로 대체
         for _, r in ranked_all.iterrows():
             if pd.isna(r.get("lat")) or pd.isna(r.get("lon")): continue
             color = pick_color(r["지역_norm"], selected_norm)
@@ -756,7 +653,7 @@ with right:
         return " · ".join(msgs)
 
     q = {
-        "vis_hi": ranked_all["방문자_점유율_norm"].quantile(0.70) if "방문자_점유율_norm" in ranked_all else 1.0,
+        "vis_hi": ranked_all["방문자_점유율_norm"].quantile(0.70),
         "acc_hi": ranked_all["access_score"].quantile(0.70) if "access_score" in ranked_all and ranked_all["access_score"].notna().any() else 1.0,
         "cwk_hi": ranked_all["cowork_norm"].quantile(0.70) if "cowork_norm" in ranked_all and ranked_all["cowork_norm"].notna().any() else 1.0,
     }
@@ -799,7 +696,7 @@ with right:
                 "title": title.strip(), "content": content.strip(),
                 "region": normalize_region_name(region_tag) if region_tag else "",
                 "author":"익명", "created": int(time.time()), "answers":[]
-            })
+            }); 
             save_store(store); st.success("질문이 등록되었습니다.")
     with tabs[1]:
         with st.form("form_board"):
@@ -853,35 +750,46 @@ if "coworking_sites" in metrics_map.columns:
     cols_to_show += ["coworking_sites","cowork_per10k"]
 if not infra_df.empty:
     cols_to_show += [
-        # 의료
-        "infra__pharmacy_count_per10k","infra__clinic_count_per10k","infra__hospital_count_per10k","infra__medical_similar_count_per10k",
-        # 편의
-        "infra__convenience_count_per10k","infra__laundry_count_per10k","infra__supermarket_count_per10k","infra__gas_station_count_per10k",
-        # 공공
-        "infra__cafe_count_per10k","infra__library_study_count_per10k",
-        # 여가/운동
-        "infra__fitness_count_per10k","infra__yoga_pilates_count_per10k","infra__pc_cafe_count_per10k","infra__karaoke_count_per10k"
+        "infra__cafe_count_per10k","infra__library_museum_count_per10k",
+        "infra__convenience_count_per10k","infra__laundry_count_per10k",
+        "infra__hospital_count_per10k","infra__pharmacy_count_per10k",
+        "infra__pc_cafe_count_per10k","infra__karaoke_count_per10k",
+        "infra__fitness_count_per10k","infra__yoga_pilates_count_per10k"
     ]
-
-rec = metrics_after_rules.copy()
-# 원래 지역명 컬럼 유지
-if "광역지자체명" not in rec.columns and "지역_norm" in rec.columns:
-    # 역매핑은 어려우므로 표시용으로 지역_norm을 사용
-    rec = rec.rename(columns={"지역_norm":"광역지자체명"})
-rec = rec.sort_values("NSI", ascending=False)[[c for c in cols_to_show if c in rec.columns]]
-
+rec = metrics_after_rules.sort_values("NSI", ascending=False)[[c for c in cols_to_show if c in metrics_after_rules.columns]]
 out = rec.copy()
-if "방문자수_합계" in out.columns: out["방문자수_합계"] = pd.to_numeric(out["방문자수_합계"], errors="coerce").fillna(0).astype(int)
+if "방문자수_합계" in out.columns: out["방문자수_합계"] = out["방문자수_합계"].fillna(0).astype(int)
 for c in out.columns:
     if c not in ["광역지자체명"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").round(4)
-
 st.dataframe(rec.reset_index(drop=True), use_container_width=True)
 st.download_button("⬇️ 랭킹 CSV 저장", out.to_csv(index=False).encode("utf-8-sig"),
                    file_name="ranking_full.csv", mime="text/csv")
 
 # ============================ 키워드 · 카테고리 탐색(그래프) ============================
 st.markdown("## 키워드 · 카테고리 탐색")
+def load_search_counts(path):
+    if not path or not os.path.exists(path):
+        return pd.DataFrame(), (None, None, None)
+    df=None
+    for enc in ["utf-8","cp949","euc-kr","utf-8-sig","latin1"]:
+        try:
+            df=pd.read_csv(path, encoding=enc, low_memory=False); break
+        except Exception:
+            df=None
+    if df is None or df.empty: return pd.DataFrame(), (None, None, None)
+    cols={c.lower():c for c in df.columns}
+    rcol=None
+    for k in ["지역","시도","시도명","광역지자체","sido","region","province"]:
+        if k in cols: rcol=cols[k]; break
+    gcol=None
+    for k in ["중분류","대분류","업종","카테고리","유형","키워드","검색어","항목"]:
+        if k in cols: gcol=cols[k]; break
+    vcol=None
+    for k in ["검색건수","검색 건수","검색수","검색량","count","건수","value","합계","총건수"]:
+        if k in cols: vcol=cols[k]; break
+    if vcol: df[vcol]=pd.to_numeric(df[vcol], errors="coerce")
+    return df, (rcol,gcol,vcol)
 
 def render_search_chart(df, cols, title_key, default_regions=None, key_prefix="cat"):
     rcol, gcol, vcol = cols

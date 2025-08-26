@@ -218,6 +218,7 @@ def build_infra_from_sources(sources):
             dfs.append(df[list(required)].copy())
     elif sources["mode"] == "zip":
         zpath = sources["paths"][0]
+        import zipfile, io
         with zipfile.ZipFile(zpath,"r") as z:
             for name in z.namelist():
                 if not name.lower().endswith(".csv"): continue
@@ -559,4 +560,113 @@ def pick_color(region_norm, selected_region_norm=None):
 # =============================== 지도 ===============================
 MAP_HEIGHT = 680
 with left:
-    m = folium.Map(location=[36.5,127.8], zoom_start=7, tiles="cartodb
+    # 🔧 여기가 에러였던 부분: 문자열을 닫고, cartodb 스타일을 정확히 지정
+    m = folium.Map(location=[36.5, 127.8], zoom_start=7, tiles="cartodb positron")
+
+    # GeoJSON 로드 및 스타일링
+    gj, gj_err = load_geojson_safe(KOREA_GEOJSON)
+    feature_name_cache = {}
+
+    def _feature_region_name(feat):
+        props = feat.get("properties", {}) if isinstance(feat, dict) else {}
+        val = ""
+        for k in GEO_PROP_KEYS:
+            if k in props and str(props[k]).strip():
+                val = str(props[k]).strip(); break
+        if not val and "name" in feat:
+            val = str(feat["name"])
+        return normalize_region_name(val)
+
+    if gj and "features" in gj:
+        # 스타일
+        def style_fn(feat):
+            rn = _feature_region_name(feat)
+            color = pick_color(rn, selected_norm)
+            return {"color": "#777777", "weight": 1, "fillColor": color, "fillOpacity": 0.65}
+
+        # 툴팁 데이터 구성
+        tooltip_fields, tooltip_alias = [], []
+        tooltip_style = ("background-color: white; color: #111; "
+                         "font-family: Pretendard, -apple-system, Segoe UI, Roboto, Arial; "
+                         "font-size: 12px; padding: 6px; border: 1px solid #ddd;")
+        # folium의 GeoJsonTooltip은 feature 속성만 바로 쓰므로 custom으로 name을 주입
+        for f in gj["features"]:
+            rn = _feature_region_name(f)
+            feature_name_cache[id(f)] = rn
+            # 지역명만 properties에 안전 주입
+            f.setdefault("properties", {})["_RNORM_"] = rn
+
+        gjson = folium.GeoJson(
+            gj,
+            name="광역시도",
+            style_function=style_fn,
+            highlight_function=lambda x: {"weight": 2, "fillOpacity": 0.85},
+            tooltip=GeoJsonTooltip(
+                fields=["_RNORM_"],
+                aliases=["지역"],
+                sticky=True,
+                style=tooltip_style
+            )
+        )
+        gjson.add_to(m)
+
+    # 각 지역 중심점에 원형 마커 + 간단 수치 표시
+    for _, row in ranked_all.iterrows():
+        rn = row["지역_norm"]
+        lat, lon = row.get("lat"), row.get("lon")
+        if pd.isna(lat) or pd.isna(lon): 
+            continue
+        popup_html = f"""
+        <div style="font-size:13px">
+            <b>{rn}</b><br/>
+            방문자 점유율: {row['방문자_점유율']*100:.2f}%<br/>
+            NSI: {row['NSI']:.3f} (랭킹 전체 {int(row['rank'])}위)
+        </div>
+        """
+        folium.CircleMarker(
+            location=(lat, lon),
+            radius=6,
+            color="#333",
+            fill=True,
+            fill_opacity=0.9,
+            fill_color=pick_color(rn, selected_norm),
+            popup=folium.Popup(popup_html, max_width=300),
+        ).add_to(m)
+
+    # Streamlit에 지도 렌더링
+    map_resp = st_folium(m, height=MAP_HEIGHT, use_container_width=True)
+
+# =============================== 오른쪽 패널 ===============================
+with right:
+    st.subheader("추천 순위")
+    show_top_n = st.slider("표시 개수", min_value=3, max_value=17, value=10, step=1)
+
+    show_cols = ["지역_norm","rank","NSI","방문자_점유율"]
+    extra_cols = []
+    if "access_score" in metrics_map.columns and selected_category=="🚉 교통 좋은 지역":
+        extra_cols.append("access_score")
+    if "cowork_norm" in metrics_map.columns and selected_category=="🏛 공공시설(워킹스페이스) 풍부 지역":
+        extra_cols += ["coworking_sites","cowork_per10k","cowork_norm"]
+    if any(c in metrics_map.columns for c in ["infra__cafe_count_norm","infra__convenience_count_norm",
+                                              "infra__hospital_count_norm","infra__pharmacy_count_norm",
+                                              "infra__pc_cafe_count_norm","infra__laundry_count_norm",
+                                              "infra__library_museum_count_norm"]):
+        # 인프라 관련 정규화 점수 요약(체크한 항목만 보임)
+        if cb_infra_cafe and "infra__cafe_count_norm" in metrics_map: extra_cols.append("infra__cafe_count_norm")
+        if cb_infra_conv and "infra__convenience_count_norm" in metrics_map: extra_cols.append("infra__convenience_count_norm")
+        if cb_infra_hosp and "infra__hospital_count_norm" in metrics_map: extra_cols.append("infra__hospital_count_norm")
+        if cb_infra_pharm and "infra__pharmacy_count_norm" in metrics_map: extra_cols.append("infra__pharmacy_count_norm")
+        if cb_infra_pc and "infra__pc_cafe_count_norm" in metrics_map: extra_cols.append("infra__pc_cafe_count_norm")
+        if cb_infra_laundry and "infra__laundry_count_norm" in metrics_map: extra_cols.append("infra__laundry_count_norm")
+        if cb_infra_lib and "infra__library_museum_count_norm" in metrics_map: extra_cols.append("infra__library_museum_count_norm")
+
+    table = (ranked.sort_values(["rank","NSI"], ascending=[True, False])
+                  [show_cols + extra_cols]
+                  .head(show_top_n)
+                  .rename(columns={"지역_norm":"지역","NSI":"종합점수","방문자_점유율":"방문자 점유율"}))
+    table["방문자 점유율"] = (table["방문자 점유율"]*100).round(2)
+
+    st.dataframe(table, use_container_width=True)
+
+    st.markdown("---")
+    st.caption("Tip: 왼쪽 지도는 상위 1~3위에 색상을 강조합니다. 사이드바에서 카테고리/인프라를 바꿔 다양한 추천을 확인하세요.")

@@ -433,7 +433,7 @@ workspace_cb   = st.sidebar.checkbox("💼 워킹 스페이스", value=False)
 leisure_cb     = st.sidebar.checkbox("🎽 여가·운동", value=False)
 lodging_cb     = st.sidebar.checkbox("🏨 숙박", value=False)
 
-# 대분류 → 내부 지표 매핑
+# 대분류 → 내부 지표 매핑 (보너스 계산용)
 cb_infra_hosp    = medical_cb
 cb_infra_pharm   = medical_cb
 cb_infra_conv    = convenience_cb
@@ -611,15 +611,27 @@ ranked_view = ranked_all.copy()
 ranked_view["display_score"] = category_display_score(ranked_all, selected_category)
 ranked_view["rank_view"]     = ranked_view["display_score"].rank(ascending=False, method="min").astype(int)
 
-# =============================== 지도 ===============================
+# ── 상위 3개 지역만 색칠하기 위한 목록/매핑 생성 ──
 COLOR_TOP1, COLOR_TOP2, COLOR_TOP3 = "#e60049", "#ffd43b", "#4dabf7"
 COLOR_SEL, COLOR_BASE = "#51cf66", "#cfd4da"
+
+TOP3 = (
+    ranked_view
+    .sort_values(["display_score", "지역_norm"], ascending=[False, True])
+    .dropna(subset=["display_score"])
+    .head(3)["지역_norm"]
+    .tolist()
+)
+TOP3_COLORS = [COLOR_TOP1, COLOR_TOP2, COLOR_TOP3]
+TOP3_COLOR_MAP = {name: TOP3_COLORS[i] for i, name in enumerate(TOP3)}
+
+# =============================== 지도 ===============================
 def pick_color(region_norm, selected_region_norm=None):
+    # 선택된 지역은 항상 강조
     if selected_region_norm and region_norm == selected_region_norm:
         return COLOR_SEL
-    r_series = ranked_view.loc[ranked_view["지역_norm"]==region_norm, "rank_view"]
-    r = int(r_series.min()) if not r_series.empty else 999
-    return {1:COLOR_TOP1, 2:COLOR_TOP2, 3:COLOR_TOP3}.get(r, COLOR_BASE)
+    # 상위 3개만 지정색, 나머지는 기본색
+    return TOP3_COLOR_MAP.get(region_norm, COLOR_BASE)
 
 MAP_HEIGHT = 680
 with left:

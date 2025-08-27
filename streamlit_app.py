@@ -58,7 +58,7 @@ def resolve_geojson_path():
 KOREA_GEOJSON = resolve_geojson_path()
 GEO_PROP_KEYS = ["name", "CTPRVN_NM", "ADM1_KOR_NM", "sido_nm", "SIG_KOR_NM", "NAME_1"]
 
--
+
 INFRA_DIR_NAME  = "소상공인시장진흥공단_상가(상권)정보_20250630"
 INFRA_ZIP_NAME  = "소상공인시장진흥공단_상가(상권)정보_20250630.zip"
 def resolve_infra_sources():

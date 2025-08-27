@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-# streamlit run streamlit_app.py
 import os, json, re, time, uuid
 import streamlit as st
 import pandas as pd
@@ -16,13 +14,13 @@ DATA_DIR = os.path.join(APP_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 CANDIDATE_BASES = [DATA_DIR, APP_DIR, "/mnt/data"]
 
-# ---------- 초기 세션 상태(안전 접근용) ----------
+
 if "selected_region" not in st.session_state:
     st.session_state["selected_region"] = None
 if "_last_clicked" not in st.session_state:
     st.session_state["_last_clicked"] = None
 
-# ------------------------------- 파일 경로 -------------------------------
+
 def build_paths():
     for base in CANDIDATE_BASES:
         fv = os.path.join(base, "20250809144224_광역별 방문자 수.csv")
@@ -60,11 +58,10 @@ def resolve_geojson_path():
 KOREA_GEOJSON = resolve_geojson_path()
 GEO_PROP_KEYS = ["name", "CTPRVN_NM", "ADM1_KOR_NM", "sido_nm", "SIG_KOR_NM", "NAME_1"]
 
-# ---- 인프라 폴더/ZIP/단일 CSV 자동 탐색 ----
+-
 INFRA_DIR_NAME  = "소상공인시장진흥공단_상가(상권)정보_20250630"
 INFRA_ZIP_NAME  = "소상공인시장진흥공단_상가(상권)정보_20250630.zip"
 def resolve_infra_sources():
-    # 폴더 → ZIP → 단일 CSV(예: 강원만) 순
     for base in CANDIDATE_BASES:
         d = os.path.join(base, INFRA_DIR_NAME)
         if os.path.isdir(d):
@@ -88,7 +85,6 @@ def resolve_infra_sources():
         return {"mode": "single", "paths": singles}
     return {"mode": "none", "paths": []}
 
-# ---------------------------- 지역명 정규화 ----------------------------
 TWOCHAR_MAP = {"서울":"서울","부산":"부산","대구":"대구","인천":"인천","광주":"광주","대전":"대전","울산":"울산","세종":"세종",
                "경기":"경기","강원":"강원","충북":"충북","충남":"충남","전북":"전북","전남":"전남","경북":"경북","경남":"경남","제주":"제주"}
 
@@ -127,7 +123,7 @@ def minmax(s):
     d = s.max() - s.min()
     return (s - s.min())/d if d>0 else s*0
 
-# ----------------------------- 로더/캐시 -----------------------------
+
 @st.cache_data(show_spinner=False)
 def load_geojson_safe(path: str):
     if not path or not os.path.exists(path): return None, "missing_path"
@@ -162,7 +158,7 @@ def read_csv_forgiving(path, usecols=None, dtype=None):
             continue
     return pd.read_csv(path, usecols=usecols, dtype=dtype, low_memory=False)
 
-# ----- 방문자 CSV 자동 컬럼 감지 -----
+
 VIS_REGION_KEYS = ["광역지자체명","광역시도","시도","시도명","region","sido","province"]
 VIS_COUNT_KEYS  = ["기초지자체 방문자 수","방문자수","방문자 수","합계","total","count"]
 
@@ -191,7 +187,7 @@ def read_visitors_flexible(path):
     df[count_col]  = pd.to_numeric(df[count_col], errors="coerce")
     return df, (region_col, count_col)
 
-# ----- 검색건수 파일 로더 -----
+
 @st.cache_data(show_spinner=False)
 def load_search_counts(path):
     if not path or not os.path.exists(path):
@@ -223,10 +219,10 @@ def load_search_counts(path):
     df[vcol]=pd.to_numeric(df[vcol], errors="coerce").fillna(0)
     return df, (rcol,gcol,vcol)
 
-# ======================== 데이터 로딩/전처리 ========================
+
 vis_df_raw, vis_cols = read_visitors_flexible(file_visitors)
 if vis_df_raw.empty:
-    st.error("방문자 데이터를 불러오지 못했습니다. 파일/컬럼명을 확인해주세요.")
+    st.error()
     st.stop()
 _region_col, _count_col = vis_cols
 vis = (vis_df_raw.groupby(_region_col, as_index=False)[_count_col].sum()
@@ -245,7 +241,7 @@ if "숙박_지출비중(%)" not in metrics_map:
 metrics_map["숙박_비중_norm"] = minmax(metrics_map["숙박_지출비중(%)"].fillna(0))
 metrics_map["NSI_base"] = 0.60*metrics_map["방문자_점유율_norm"] + 0.40*metrics_map["숙박_비중_norm"]
 
-# ==================== 인프라 지표(상가 폴더/ZIP/단일 CSV) ====================
+
 @st.cache_data(show_spinner=True)
 def build_infra_from_sources(sources):
     import io, zipfile
@@ -316,7 +312,7 @@ def build_infra_from_sources(sources):
         agg[col+"_norm"] = ((v-v.min())/rng).fillna(0).round(4) if rng>0 else v*0
     return agg
 
-# ==================== 교통/코워킹 ====================
+
 @st.cache_data(show_spinner=False)
 def load_transport(path):
     if not path: return pd.DataFrame()
@@ -412,7 +408,7 @@ def load_coworking(path):
     g=g[g["지역_norm"]!=""]
     return g.value_counts("지역_norm").rename("coworking_sites").reset_index()
 
-# ============================ UI ============================
+
 st.title("디지털 노마드 지역 추천 대시보드")
 left, right = st.columns([2, 1])
 with left:
@@ -433,7 +429,7 @@ workspace_cb   = st.sidebar.checkbox("💼 워킹 스페이스", value=False)
 leisure_cb     = st.sidebar.checkbox("🎽 여가·운동", value=False)
 lodging_cb     = st.sidebar.checkbox("🏨 숙박", value=False)
 
-# 대분류 → 내부 지표 매핑 (보너스 계산용)
+
 cb_infra_hosp    = medical_cb
 cb_infra_pharm   = medical_cb
 cb_infra_conv    = convenience_cb
@@ -442,11 +438,6 @@ cb_infra_cafe    = workspace_cb
 cb_infra_lib     = workspace_cb
 cb_infra_pc      = leisure_cb
 cb_infra_accom   = lodging_cb
-
-st.sidebar.markdown("---")
-with st.sidebar.expander("🧪 데이터 진단/디버그", expanded=False):
-    st.write("**경로 확인**")
-    st.code(f"방문자: {file_visitors}\n업종검색: {file_search_cat}\n유형검색: {file_search_type}")
 
 need_infra  = any([medical_cb, convenience_cb, workspace_cb, leisure_cb, lodging_cb]) or (selected_category=="💼 코워킹 인프라 풍부 지역")
 need_access = (selected_category=="🚉 교통 좋은 지역")
@@ -499,7 +490,7 @@ if need_cowork:
         cow["cowork_norm"]=((v-v.min())/rng).fillna(0) if rng>0 else (v*0)
         metrics_map = metrics_map.merge(cow[["지역_norm","coworking_sites","cowork_per10k","cowork_norm"]], on="지역_norm", how="left")
 
-# ----------------------------- 보너스/룰 -----------------------------
+
 def _compute_bonus_columns(g, selected_category):
     CAT_BONUS   = 0.15
     INFRA_BONUS = 0.10
@@ -611,7 +602,7 @@ ranked_view = ranked_all.copy()
 ranked_view["display_score"] = category_display_score(ranked_all, selected_category)
 ranked_view["rank_view"]     = ranked_view["display_score"].rank(ascending=False, method="min").astype(int)
 
-# ── 상위 3개 지역만 색칠하기 위한 목록/매핑 생성 ──
+
 COLOR_TOP1, COLOR_TOP2, COLOR_TOP3 = "#e60049", "#ffd43b", "#4dabf7"
 COLOR_SEL, COLOR_BASE = "#51cf66", "#cfd4da"
 
@@ -625,12 +616,10 @@ TOP3 = (
 TOP3_COLORS = [COLOR_TOP1, COLOR_TOP2, COLOR_TOP3]
 TOP3_COLOR_MAP = {name: TOP3_COLORS[i] for i, name in enumerate(TOP3)}
 
-# =============================== 지도 ===============================
+
 def pick_color(region_norm, selected_region_norm=None):
-    # 선택된 지역은 항상 강조
     if selected_region_norm and region_norm == selected_region_norm:
         return COLOR_SEL
-    # 상위 3개만 지정색, 나머지는 기본색
     return TOP3_COLOR_MAP.get(region_norm, COLOR_BASE)
 
 MAP_HEIGHT = 680
@@ -719,7 +708,7 @@ with left:
         st.session_state["selected_region"] = clicked_name
         st.session_state["_last_clicked"] = clicked_name
 
-# ============================ 우측 패널 ============================
+
 with right:
     st.subheader("커뮤니티")
     st.markdown("### 지역 하이라이트")
@@ -806,7 +795,7 @@ with right:
                             p.setdefault("comments",[]).append({"content":cmt.strip(),"author":"익명","created":int(time.time())})
                             save_store(store); st.success("댓글이 등록되었습니다.")
 
-# ============================ 랭킹/다운로드 ============================
+
 st.subheader("추천 랭킹 (Top 5)")
 cols_to_show = ["광역지자체명","display_score","NSI","NSI_base","방문자수_합계","방문자_점유율","숙박_지출비중(%)"]
 if "access_score" in metrics_map.columns and metrics_map["access_score"].notna().any():
@@ -829,7 +818,7 @@ st.dataframe(top5.reset_index(drop=True), use_container_width=True)
 st.download_button("⬇️ 전체 랭킹 CSV 저장", out.to_csv(index=False).encode("utf-8-sig"),
                    file_name="ranking_full.csv", mime="text/csv")
 
-# ============================ 키워드 · 카테고리 탐색 ============================
+
 st.markdown("## 키워드 · 카테고리 탐색")
 search_cat_df, search_cat_cols   = load_search_counts(file_search_cat)
 search_type_df, search_type_cols = load_search_counts(file_search_type)

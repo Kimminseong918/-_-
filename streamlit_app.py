@@ -21,8 +21,6 @@ if "selected_region" not in st.session_state:
     st.session_state["selected_region"] = None
 if "_last_clicked" not in st.session_state:
     st.session_state["_last_clicked"] = None
-if "qna_store" not in st.session_state:
-    st.session_state["qna_store"] = {"posts": []}
 
 # ------------------ 파일 경로 ------------------
 def build_paths():
@@ -90,7 +88,7 @@ def resolve_infra_sources():
     return {"mode": "none", "paths": []}
 
 # ------------------ 지역명 정규화 ------------------
-TWOCHAR_MAP = {"서울":"서울","부산":"부산","대구":"대구","인천":"इन천","광주":"광주","대전":"대전","울산":"울산","세종":"세종",
+TWOCHAR_MAP = {"서울":"서울","부산":"부산","대구":"대구","인천":"인천","광주":"광주","대전":"대전","울산":"울산","세종":"세종",
                "경기":"경기","강원":"강원","충북":"충북","충남":"충남","전북":"전북","전남":"전남","경북":"경북","경남":"경남","제주":"제주"}
 
 def to_twochar(s: str) -> str:
@@ -226,7 +224,7 @@ def load_search_counts(path):
 # ======================== 데이터 로딩/전처리 ========================
 vis_df_raw, vis_cols = read_visitors_flexible(file_visitors)
 if vis_df_raw.empty:
-    st.error("방문자 데이터가 없습니다. CSV 경로/컬럼을 확인하세요.")
+    st.error()
     st.stop()
 _region_col, _count_col = vis_cols
 vis = (vis_df_raw.groupby(_region_col, as_index=False)[_count_col].sum()
@@ -239,9 +237,11 @@ vis_region["지역_norm"] = vis_region["광역지자체명"].map(normalize_regio
 metrics_map = vis_region.copy()
 coords_df = pd.DataFrame([{"지역_norm":k,"lat":v[0],"lon":v[1]} for k,v in REGION_COORDS.items()])
 metrics_map = metrics_map.merge(coords_df, on="지역_norm", how="left")
+
+# 방문자 정규화
 metrics_map["방문자_점유율_norm"] = minmax(metrics_map["방문자_점유율"].fillna(0))
 
-# ── 업종 검색 데이터로 숙박 비중(%) 계산(없으면 NaN) ──
+# ── (수정) 업종별 검색 데이터로 숙박 비중(%) 계산 ──
 s_cat_df, s_cat_cols = load_search_counts(file_search_cat)
 if not s_cat_df.empty and all(s_cat_cols):
     rcol, gcol, vcol = s_cat_cols
@@ -249,26 +249,33 @@ if not s_cat_df.empty and all(s_cat_cols):
     tmp["_지역_"] = tmp[rcol].astype(str).map(normalize_region_name)
     tmp["_카테고리_"] = tmp[gcol].astype(str)
     tmp[vcol] = pd.to_numeric(tmp[vcol], errors="coerce").fillna(0)
-    total = (tmp.groupby("_지역_", as_index=False)[vcol].sum()
-                .rename(columns={vcol: "_total_"}))
+
+    total = (tmp.groupby("_지역_", as_index=False)[vcol]
+                .sum().rename(columns={vcol: "_total_"}))
+
     lodg_mask = tmp["_카테고리_"].str.contains(
         r"숙박|호텔|모텔|게스트하우스|게하|호스텔|리조트|펜션|민박|B&B|bnb",
         case=False, na=False
     )
     lodg = (tmp[lodg_mask].groupby("_지역_", as_index=False)[vcol]
                 .sum().rename(columns={vcol: "_lodging_"}))
+
     lodg_share = total.merge(lodg, on="_지역_", how="left")
     lodg_share["_lodging_"] = lodg_share["_lodging_"].fillna(0)
     lodg_share["숙박_지출비중(%)"] = (
         (lodg_share["_lodging_"] / lodg_share["_total_"]).replace([np.inf, np.nan], 0) * 100
     )
-    metrics_map = metrics_map.merge(
+
+    metrics_map = metrics_map.drop(
+        columns=[c for c in ["숙박_지출비중(%)","숙박_비중_norm","NSI_base"] if c in metrics_map.columns]
+    ).merge(
         lodg_share[["_지역_", "숙박_지출비중(%)"]].rename(columns={"_지역_":"지역_norm"}),
         on="지역_norm", how="left"
     )
 else:
     metrics_map["숙박_지출비중(%)"] = np.nan
 
+# 숙박 비중 정규화 & 기본 점수
 metrics_map["숙박_비중_norm"] = minmax(metrics_map["숙박_지출비중(%)"].fillna(0))
 metrics_map["NSI_base"] = 0.60*metrics_map["방문자_점유율_norm"] + 0.40*metrics_map["숙박_비중_norm"]
 
@@ -315,17 +322,14 @@ def build_infra_from_sources(sources):
     mid=df["상권업종중분류명"].astype(str)
     sub=df["상권업종소분류명"].astype(str)
     std=df["표준산업분류명"].astype(str)
-
-    # 간단 분류
-    m_cafe=(sub.str.contains("카페", na=False)) | (std.str.contains("커피 전문점", na=False))
-    m_conv=(sub.str.contains("편의점", na=False)) | (std.str.contains("체인화 편의점", na=False))
-    m_hotel=sub.str.contains("호텔/리조트", na=False); m_motel=sub.str.contains("여관/모텔", na=False); m_accom_mid=mid.str.contains("숙박", na=False)
-    m_pc=sub.str.contains("PC방", na=False); m_laundry=sub.str.contains("세탁소|빨래방", na=False)
-    m_pharmacy=sub.str.contains("약국", na=False)
-    m_clinic=mid.str.contains("의원", na=False)
-    m_hospital=mid.str.contains("병원", na=False) | m_clinic | sub.str.contains("치과의원|한의원|내과|외과|피부|비뇨", na=False)
-    m_library=mid.str.contains("도서관·사적지|도서관", na=False)
-
+    m_cafe=(sub.str.contains("카페")) | (std.str.contains("커피 전문점"))
+    m_conv=(sub.str.contains("편의점")) | (std.str.contains("체인화 편의점"))
+    m_hotel=sub.str.contains("호텔/리조트"); m_motel=sub.str.contains("여관/모텔"); m_accom_mid=mid.str.contains("숙박")
+    m_pc=sub.str.contains("PC방"); m_laundry=sub.str.contains("세탁소|빨래방")
+    m_pharm=sub.str.contains("약국")
+    m_clinic=mid.str.contains("의원")
+    m_hospital=mid.str.contains("병원") | m_clinic | sub.str.contains("치과의원|한의원|내과|외과|피부|비뇨")
+    m_library=mid.str.contains("도서관·사적지|도서관")
     df["sido_norm"]=df["시도명"].map(normalize_region_name)
     agg=df.groupby("sido_norm").agg(
         total_places=("시도명","size"),
@@ -338,7 +342,6 @@ def build_infra_from_sources(sources):
         laundry_count=("시도명", lambda s:int(m_laundry.loc[s.index].sum())),
         library_museum_count=("시도명", lambda s:int(m_library.loc[s.index].sum())),
     ).reset_index()
-
     def per_10k(n,total): total=total.replace(0,np.nan); return (n/total)*10000
     for col in ["cafe_count","convenience_count","accommodation_count","hospital_count",
                 "pharmacy_count","pc_cafe_count","laundry_count","library_museum_count"]:
@@ -444,16 +447,8 @@ def load_coworking(path):
     return g.value_counts("지역_norm").rename("coworking_sites").reset_index()
 
 # ============================ UI ============================
-# 약간의 여백/폰트 정리로 꽉 찬 느낌 강화
-st.markdown("""
-<style>
-    .block-container {padding-top: 1.2rem; padding-bottom: 1rem;}
-    .stTabs [data-baseweb="tab-list"] {gap: .4rem;}
-</style>
-""", unsafe_allow_html=True)
-
 st.title("디지털 노마드 지역 추천 대시보드")
-left, right = st.columns([1.9, 1.0])   # 왼쪽(지도) 조금 더 넓게
+left, right = st.columns([2, 1])
 with left:
     st.subheader("지도에서 지역을 선택하세요")
 
@@ -472,12 +467,16 @@ workspace_cb   = st.sidebar.checkbox("💼 워킹 스페이스", value=False)
 leisure_cb     = st.sidebar.checkbox("🎽 여가·운동", value=False)
 lodging_cb     = st.sidebar.checkbox("🏨 숙박", value=False)
 
-# (옵션) 지도 높이 수동 조절
-st.sidebar.markdown("---")
-manual_h_on = st.sidebar.checkbox("지도 높이 수동 조절", value=False)
-manual_h    = st.sidebar.slider("지도 높이(px)", 600, 1600, 980, 10) if manual_h_on else None
-
 # 대분류 플래그
+cb_infra_hosp    = medical_cb
+cb_infra_pharm   = medical_cb
+cb_infra_conv    = convenience_cb
+cb_infra_laundry = convenience_cb
+cb_infra_cafe    = workspace_cb
+cb_infra_lib     = workspace_cb
+cb_infra_pc      = leisure_cb
+cb_infra_accom   = lodging_cb
+
 need_infra  = any([medical_cb, convenience_cb, workspace_cb, leisure_cb, lodging_cb]) or (selected_category=="💼 코워킹 인프라 풍부 지역")
 need_access = (selected_category=="🚉 교통 좋은 지역")
 need_cowork = (selected_category=="💼 코워킹 인프라 풍부 지역")
@@ -562,7 +561,6 @@ def _compute_bonus_columns(g, selected_category):
         "pharm":"infra__pharmacy_count_norm", "pc":"infra__pc_cafe_count_norm",
         "laundry":"infra__laundry_count_norm", "lib":"infra__library_museum_count_norm",
     }
-    # 체크한 인프라에 따른 보너스
     if medical_cb:
         if has(infra_cols["hosp"]):   bonus += INFRA_BONUS * g[infra_cols["hosp"]].fillna(0)
         if has(infra_cols["pharm"]):  bonus += INFRA_BONUS * g[infra_cols["pharm"]].fillna(0)
@@ -661,24 +659,8 @@ def pick_color(region_norm, selected_region_norm=None):
         return COLOR_SEL
     return TOP3_COLOR_MAP.get(region_norm, COLOR_BASE)
 
-# ---- 지도 높이 자동 추정: 우측 패널 길이에 맞추기 ----
-def estimate_right_panel_height(store: dict) -> int:
-    """우측 콘텐츠 양을 대충 추정해 지도 높이(px)를 반환."""
-    posts = store.get("posts", [])
-    num_posts = len(posts)
-    # 하이라이트 + 폼 + 탭 등 기본 높이
-    base = 520
-    # 피드 목록(접힌 상태 기준, 항목당 대략 높이)
-    per_post = 90
-    est = base + min(num_posts, 10) * per_post
-    # 상/하한 클램프
-    return int(max(700, min(1400, est)))
-
-# =============================== 지도 렌더 ===============================
+MAP_HEIGHT = 680
 with left:
-    # 지도 높이 결정 (수동 > 자동)
-    MAP_HEIGHT = manual_h if manual_h_on else estimate_right_panel_height(st.session_state["qna_store"])
-
     m = folium.Map(location=[36.5,127.8], zoom_start=7, tiles="cartodbpositron", prefer_canvas=True)
     gj, gj_err = (None, "no_path")
     if KOREA_GEOJSON and os.path.exists(KOREA_GEOJSON):
@@ -744,9 +726,7 @@ with left:
           </div>
         </div>"""
         m.get_root().html.add_child(folium.Element(legend_html))
-
     map_state = st_folium(m, width=None, height=MAP_HEIGHT, key="main_map")
-
     def extract_clicked_name(state):
         if not state: return None
         nm = state.get("last_object_clicked_popup")
@@ -760,7 +740,6 @@ with left:
             nm = obj.get("popup") or (obj.get("properties", {}) or {}).get("REGION_NAME")
             if nm: return normalize_region_name(str(nm))
         return None
-
     clicked_name = extract_clicked_name(map_state)
     if clicked_name and clicked_name != st.session_state.get("_last_clicked"):
         st.session_state["selected_region"] = clicked_name
@@ -792,10 +771,7 @@ with right:
             with open(STORE_PATH,"w",encoding="utf-8") as f: json.dump(data,f,ensure_ascii=False,indent=2)
         except Exception:
             st.warning("게시글 저장에 실패했습니다. 쓰기 권한을 확인하세요.")
-
-    # 세션 보관소 동기화
-    if os.path.exists(STORE_PATH) and not st.session_state["qna_store"]["posts"]:
-        st.session_state["qna_store"] = load_store()
+    if "qna_store" not in st.session_state: st.session_state["qna_store"] = load_store()
     store = st.session_state["qna_store"]
 
     tabs = st.tabs(["질문 올리기(QnA)", "글쓰기(게시판)", "피드 보기"])
@@ -811,7 +787,7 @@ with right:
                 "title": title.strip(), "content": content.strip(),
                 "region": normalize_region_name(region_tag) if region_tag else "",
                 "author":"익명", "created": int(time.time()), "answers":[]
-            })
+            }); 
             save_store(store); st.success("질문이 등록되었습니다.")
     with tabs[1]:
         with st.form("form_board"):

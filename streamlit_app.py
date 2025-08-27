@@ -224,7 +224,7 @@ def load_search_counts(path):
 # ======================== 데이터 로딩/전처리 ========================
 vis_df_raw, vis_cols = read_visitors_flexible(file_visitors)
 if vis_df_raw.empty:
-    st.error()
+    st.error("방문자 파일을 불러오지 못했습니다.")
     st.stop()
 _region_col, _count_col = vis_cols
 vis = (vis_df_raw.groupby(_region_col, as_index=False)[_count_col].sum()
@@ -831,6 +831,83 @@ with right:
                         if st.form_submit_button("등록") and cmt.strip():
                             p.setdefault("comments",[]).append({"content":cmt.strip(),"author":"익명","created":int(time.time())})
                             save_store(store); st.success("댓글이 등록되었습니다.")
+
+# ============================ 🔎 핵심지표 현황 ============================
+st.markdown("## 🔎 핵심지표 현황 (전국 평균 & 선택 지역 비교)")
+
+core_metric_labels = {
+    "방문자_점유율": "방문자 점유율",
+    "숙박_지출비중(%)": "숙박 지출 비중(%)",
+    "access_score": "교통 접근성(정규화)",
+    "cowork_per10k": "코워킹 인프라(1만 개 업소당)",
+    "cowork_norm": "코워킹 인프라(정규화)",
+    "NSI": "NSI(가중 보너스 반영)",
+    "NSI_base": "NSI_base(기본)"
+}
+
+def pick_existing(cols, df):
+    return [c for c in cols if c in df.columns]
+
+num_cols = pick_existing(list(core_metric_labels.keys()), ranked_all)
+
+if not num_cols:
+    st.info("핵심지표를 계산할 수 있는 컬럼이 없어 요약을 표시하지 않습니다.")
+else:
+    core_df = ranked_all[["지역_norm"] + num_cols].copy()
+    desc = core_df[num_cols].describe().T
+    desc = desc.rename(columns={"mean": "평균", "std": "표준편차", "50%": "중앙값", "min": "최솟값", "max": "최댓값", "25%": "하위 25%", "75%": "상위 25%"}).round(4)
+    desc.index = [core_metric_labels.get(c, c) for c in desc.index]
+
+    st.markdown("### 📍 선택 지역 vs 전국 평균")
+    sel = None
+    if st.session_state.get("selected_region"):
+        key = normalize_region_name(st.session_state["selected_region"])
+        tmp = core_df.loc[core_df["지역_norm"] == key]
+        if not tmp.empty:
+            sel = tmp.iloc[0]
+
+    rows = (len(num_cols) + 1) // 2
+    for r in range(rows):
+        c1, c2 = st.columns(2)
+        for i, col in enumerate(num_cols[r*2 : r*2+2]):
+            container = c1 if i == 0 else c2
+            with container:
+                label = core_metric_labels.get(col, col)
+                col_series = pd.to_numeric(core_df[col], errors="coerce")
+                avg = col_series.mean()
+
+                def fmt(v, colname):
+                    if pd.isna(v): return "-"
+                    # 퍼센트/점유율 표기 처리
+                    if ("지출비중" in colname) or ("점유율" in colname):
+                        if col_series.max(skipna=True) is not None and col_series.max(skipna=True) <= 1.0:
+                            return f"{float(v)*100:.2f}%"
+                        return f"{float(v):.2f}%"
+                    return f"{float(v):.3f}"
+
+                if sel is not None:
+                    val = float(sel[col]) if pd.notna(sel[col]) else np.nan
+                    delta = val - avg if pd.notna(val) else np.nan
+                    if ("지출비중" in col) or ("점유율" in col):
+                        if col_series.max(skipna=True) <= 1.0:
+                            st.metric(label, f"{(val if pd.notna(val) else 0)*100:.2f}%", delta=f"{(delta if pd.notna(delta) else 0)*100:+.2f}%p")
+                        else:
+                            st.metric(label, f"{(val if pd.notna(val) else 0):.2f}%", delta=f"{(delta if pd.notna(delta) else 0):+.2f}%p")
+                    else:
+                        st.metric(label, fmt(val, col), delta=f"{(delta if pd.notna(delta) else 0):+.3f}")
+                else:
+                    st.metric(label + " (전국 평균)", fmt(avg, col))
+
+    st.markdown("### 📊 전국 분포 요약")
+    st.dataframe(desc[["평균", "중앙값", "표준편차", "하위 25%", "상위 25%", "최솟값", "최댓값"]])
+
+    with st.expander("분포 보기(히스토그램)"):
+        sel_cols = st.multiselect("분포를 볼 지표 선택", options=num_cols,
+                                  format_func=lambda c: core_metric_labels.get(c, c),
+                                  default=num_cols[:2])
+        for col in sel_cols:
+            st.caption(f"• {core_metric_labels.get(col, col)}")
+            st.bar_chart(pd.to_numeric(core_df[col], errors="coerce").sort_values().reset_index(drop=True))
 
 # ============================ 랭킹/다운로드 ============================
 st.subheader("추천 랭킹 (Top 5)")

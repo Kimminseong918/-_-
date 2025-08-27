@@ -795,6 +795,40 @@ else:
             st.caption(f"• {core_metric_labels.get(col, col)}")
             st.bar_chart(core_df[col].sort_values().reset_index(drop=True))
 
+# ============================ 🏠 생활 인프라 · 💼 코워킹 인프라 전국 평균 ============================
+st.markdown("## 🏠 생활 인프라 · 💼 코워킹 인프라 전국 평균")
+
+infra_cols = [
+    "infra__cafe_count_per10k",
+    "infra__convenience_count_per10k",
+    "infra__accommodation_count_per10k",
+    "infra__hospital_count_per10k",
+    "infra__pharmacy_count_per10k",
+    "infra__pc_cafe_count_per10k",
+    "infra__laundry_count_per10k",
+    "infra__library_museum_count_per10k",
+]
+existing_infra_cols = [c for c in infra_cols if c in metrics_map.columns]
+
+if existing_infra_cols:
+    infra_means = metrics_map[existing_infra_cols].mean().round(3)
+    st.dataframe(
+        infra_means.rename("전국 평균").reset_index().rename(columns={"index": "지표"}),
+        use_container_width=True
+    )
+else:
+    st.info("생활 인프라 지표를 계산할 수 있는 데이터가 없습니다.")
+
+# 코워킹 인프라 평균 (있을 때만)
+if "cowork_per10k" in metrics_map.columns:
+    avg_cowork = pd.to_numeric(metrics_map["cowork_per10k"], errors="coerce").mean()
+    if pd.notna(avg_cowork):
+        st.metric("코워킹 인프라 (1만 업소당) — 전국 평균", f"{avg_cowork:.3f}")
+    else:
+        st.info("코워킹 인프라 값이 없어 평균을 계산할 수 없습니다.")
+else:
+    st.info("코워킹 인프라 데이터가 없습니다.")
+
 # ============================ 랭킹/다운로드 ============================
 st.subheader("추천 랭킹 (Top 5)")
 cols_to_show = ["광역지자체명","display_score","NSI","NSI_base",
